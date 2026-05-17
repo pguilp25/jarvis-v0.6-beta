@@ -708,13 +708,91 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
         else:
             usages.append(entry)
 
+    # SECOND PASS — detect multi-line parenthesized imports the single-line
+    # categorizer would miss. Pattern: `from X import (... Name ...)` where
+    # `Name` lands on a continuation line. Without this, a re-export like
+    #   from .table import (Table, QTable, ...,
+    #                       NdarrayMixin, ...)
+    # gets classified as USED (the continuation line just lists names)
+    # instead of IMPORTED, leaving the consumer invisible to the agent.
+    # Observed failure on astropy-13236: agent ran [REFS: NdarrayMixin],
+    # didn't see the `__init__.py` re-export was an import, deleted it,
+    # broke 644 tests.
+    #
+    # We run a SEPARATE project-wide ripgrep with multi-line mode (-U) so
+    # we catch consumers in files that didn't make the main result's
+    # 30-entry cap. The pattern matches parenthesized `from X import (`
+    # blocks containing the symbol.
+    multiline_hits: list[str] = []
+    try:
+        ml_pattern = rf"from\s+\S+\s+import\s+\([^)]*\b{re.escape(name)}\b[^)]*\)"
+        cp_ml = subprocess.run(
+            ["rg", "-U", "--line-number", "--no-heading", "--color=never",
+             "-g", "*.py",   # ripgrep uses --glob / -g, not --include
+             *ignore_args,
+             ml_pattern, root],
+            capture_output=True, text=True, timeout=15,
+        )
+        if cp_ml.returncode <= 1 and cp_ml.stdout.strip():
+            for line in cp_ml.stdout.splitlines()[:20]:
+                # ripgrep -U returns `path:line:content` with content being
+                # the FIRST line of the multi-line match
+                parts = line.split(":", 2)
+                if len(parts) < 3:
+                    continue
+                fp, ln, content = parts
+                # Skip the file we're searching against (if name is defined
+                # there). This is rare for re-export checks.
+                try:
+                    rel = str(Path(fp).resolve().relative_to(Path(root).resolve()))
+                except ValueError:
+                    rel = fp
+                opener = content.strip()
+                multiline_hits.append(
+                    f"  {rel}:{ln}  {opener}  (multi-line import contains {name})"
+                )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # De-dup multiline hits — both against single-line imports and against
+    # other multiline-hit lines pointing at the SAME multi-line block.
+    # ripgrep -U emits one output line per matched line, so a 3-line
+    # import block produces 3 hits all pointing at the same block. Keep
+    # only the FIRST (the `from X import (` opener line); skip continuation
+    # lines (which start with whitespace + just names).
+    def _file_line_key(entry: str) -> str:
+        # Format: "  <rel>:<lineno>  <content>  …" — extract "<rel>:<lineno>"
+        stripped = entry.lstrip()
+        return stripped.split("  ", 1)[0]
+
+    existing_keys = {_file_line_key(imp) for imp in imports}
+    deduped_ml: list[str] = []
+    seen_ml_files: set[str] = set()  # per-file: keep only the OPENER hit
+    for h in multiline_hits:
+        key = _file_line_key(h)
+        file_part = key.rsplit(":", 1)[0] if ":" in key else key
+        if key in existing_keys:
+            continue
+        # Only keep the FIRST hit per file (the opener line)
+        if file_part in seen_ml_files:
+            continue
+        # Skip continuation-line entries (content starts with whitespace +
+        # bare names; doesn't contain `from` or `import`)
+        content_part = h.lstrip().split("  ", 1)[1] if "  " in h.lstrip() else ""
+        if "from " not in content_part.split("(")[0]:
+            continue
+        seen_ml_files.add(file_part)
+        deduped_ml.append(h)
+    multiline_hits = deduped_ml
+
     parts = [f"=== References for '{name}' ==="]
     if definitions:
         parts.append(f"\nDEFINED ({len(definitions)}):")
         parts.extend(definitions)
-    if imports:
-        parts.append(f"\nIMPORTED ({len(imports)}):")
+    if imports or multiline_hits:
+        parts.append(f"\nIMPORTED ({len(imports) + len(multiline_hits)}):")
         parts.extend(imports)
+        parts.extend(multiline_hits)
     if usages:
         parts.append(f"\nUSED ({len(usages)}):")
         parts.extend(usages)

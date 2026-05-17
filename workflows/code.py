@@ -554,6 +554,130 @@ under ADD, every missing ACTION should justify itself against "would
 a thoughtful engineer add this alongside the feature?".
 
 ══════════════════════════════════════════════════════════════════════
+MID-PLAN VERIFICATION TRIGGERS — fire tools BEFORE the relevant section
+══════════════════════════════════════════════════════════════════════
+
+Plan writing is NOT linear. The tools below execute mid-plan: write
+part of the plan, drop into `[tool use] ... [/tool use] [STOP]
+[CONFIRM_STOP]`, receive the result on the next round, then continue
+the plan with the new evidence baked in. Use this freely.
+
+When ANY of the four triggers below applies, fire the named tool
+BEFORE writing the plan section that depends on it. Skipping a
+trigger is the most common cause of "almost right" plans.
+
+TRIGGER 1 — TASK MENTIONS A SPECIFIC BUG, ERROR STRING, OR BEHAVIOR
+────────────────────────────────────────────────────────────────────
+The failing test is the precise contract. If the user describes a
+bug ("X returns Y when it should return Z", "error message is
+confusing", "operation crashes with TypeError"), the project has at
+least one test that asserts against the corrected behavior. The
+agent must find and read it BEFORE designing the fix — its
+assertion text is binding.
+
+How to find the failing test when the user doesn't name it:
+  ▸ [SEARCH: <distinctive substring of the error message>]
+    Example issue says "expected 'time' as the first columns but
+    found 'time'" → [SEARCH: "as the first column"] finds the test
+    asserting the expected wording.
+  ▸ [SEARCH: <function or class name from the repro>]  scoped to
+    a tests directory.
+    Example: issue talks about `Quantity.__array_ufunc__` →
+    [SEARCH: TestUfuncReturnsNotImplemented] or
+    [SEARCH: def test.*array_ufunc].
+  ▸ [REFS: <symbol_from_repro>]  — DEFINED entries in `tests/`
+    directories point you at the test files.
+
+Once located: [CODE: <test_file>] and READ THE ASSERTIONS. Quote
+them in the plan body verbatim — the coder will match them
+character-by-character.
+
+TRIGGER 2 — PLAN INCLUDES A DELETION OF TOP-LEVEL `class` / `def` / `import`
+────────────────────────────────────────────────────────────────────────────
+Before writing a STEP that DELETES any top-level definition or
+import, fire `[LSP: <name>]` (or `[REFS: <name>]` if no LSP server
+is available). LSP returns the FULL list of references project-wide
+with no cap. Then read the result:
+
+  ▸ Is the name imported from this module by ANY other file? It's
+    a public re-export — DO NOT delete it without updating all
+    consumers in the same plan (often `__init__.py` re-exports).
+  ▸ Is it called / instantiated / type-checked anywhere outside
+    this file? Same rule — update consumers.
+
+Observed regression (astropy-13398): deleted the `ITRS` class
+without LSP-checking → 68 test files broke at import time.
+Observed regression (astropy-13236): deleted `from .ndarray_mixin
+import NdarrayMixin` without LSP-checking the parenthesized re-
+export in `__init__.py` → 644 tests broke at collection.
+
+Both would have been caught by ONE `[LSP: ClassName]` mid-plan.
+
+TRIGGER 3 — PLAN BROADENS EXCEPTION HANDLING (try/except, raise → return, etc.)
+─────────────────────────────────────────────────────────────────────────────
+When the plan says "wrap X in try/except and return Y instead", an
+existing test may be pinning the original exception. Before
+finalizing the STEP, fire:
+
+  ▸ [SEARCH: pytest.raises\\((TypeError|ValueError|YourException))]
+    scoped to the tests directory of the affected module.
+  ▸ [REFS: <function_being_changed>] — DEFINED entries in test/
+    files show which tests exercise the function.
+
+Read the matching tests. If they assert the exception IS raised
+in the scenarios you're now suppressing, the except is too broad.
+Narrow it (specific exception subclass, specific input condition,
+or narrow the try-block to a single line).
+
+Observed regression (astropy-13977): wrapped converter loop in
+`except (TypeError, ValueError): return NotImplemented`. Caught
+TypeErrors that `test_basic` was asserting against → 4 P→P tests
+regressed. ONE search for `pytest.raises` in the test file would
+have surfaced the conflict.
+
+TRIGGER 4 — ISSUE USES PLURAL LANGUAGE ("commands", "fields", "operators")
+─────────────────────────────────────────────────────────────────────────
+A plural noun in the bug description means the bug affects multiple
+instances of a pattern, not just the one example shown. Before
+writing the STEP, enumerate ALL instances:
+
+  ▸ [SEARCH: <the common pattern>] across the affected module.
+    Example: issue says "ascii.qdp assumes commands are upper case"
+    → [SEARCH: "[A-Z]+\\s+\\(0-9"] or [SEARCH: command_re] across
+    qdp.py to find ALL command regexes, not just READ.
+  ▸ [REFS: <function_handling_commands>] — find the central
+    dispatcher and trace its inputs.
+
+The fix is then comprehensive (every command regex made case-
+insensitive), not just the single one the example shows.
+
+Observed regression (astropy-14365): patched ONE regex
+`_command_re` to be case-insensitive; missed the other regexes
+in `qdp.py` that also assumed uppercase → `test_roundtrip[True]`
+still fails.
+
+HOW THIS WORKS WITH THE PLAN WRITE FLOW
+───────────────────────────────────────
+The triggers fire IN-FLIGHT, between plan sections. Concrete shape:
+
+  [think] orient briefly, see if any trigger applies [/think]
+  [tool use] [SEARCH: "as the first column"] [/tool use]
+  [STOP][CONFIRM_STOP]
+
+  ← next round: tool result arrives in your context →
+
+  [think] OK — test_required_columns asserts the exact wording
+  `expected 'time' as the first column but found 'X'`. I'll
+  quote that verbatim in the STEP body. [/think]
+  === PLAN ===
+  ## TASK SHAPE: FIX (test_required_columns pins exact error string)
+  ## GOAL …
+
+You can fire 1-3 verification tools in a single `[tool use]` batch,
+or sprinkle them between plan sections. The plan grows incrementally
+with each verification baked in.
+
+══════════════════════════════════════════════════════════════════════
 HOW MUCH TO THINK UPFRONT — and when to commit
 ══════════════════════════════════════════════════════════════════════
 
@@ -3268,6 +3392,46 @@ code. Trust their findings unless something looks obviously wrong. Your
 value is JUDGMENT (picking + improving), not re-investigation.
 
 ══════════════════════════════════════════════════════════════════════
+MID-PLAN VERIFICATION TRIGGERS — fire tools BEFORE the relevant section
+══════════════════════════════════════════════════════════════════════
+
+The four triggers below apply to plan-writing roles (Layer 1 / Layer 2
+/ Layer 3). If the input plans don't show evidence of having fired
+them — or if you identify a new claim in your IMPROVED plan that
+warrants one — fire it mid-plan via `[tool use] ... [/tool use] [STOP]
+[CONFIRM_STOP]`. The result arrives next round; you continue the
+plan with the evidence baked in.
+
+  T1 — Issue mentions a bug / error / behavior. The failing test is
+       the binding contract. Find it via
+       `[SEARCH: "<distinctive substring>"]` or
+       `[REFS: <function_from_repro>]` scoped to tests/, then
+       `[CODE: <test_file>]`. Quote the assertion verbatim in the
+       plan.
+
+  T2 — Plan deletes a top-level `class` / `def` / `import`. Fire
+       `[LSP: <name>]` (or `[REFS: <name>]` if no LSP server) to
+       enumerate consumers project-wide BEFORE finalizing the
+       deletion. If consumers exist, the deletion must include
+       updating them in the same plan — or it must be downgraded
+       to a deprecation rather than a removal.
+
+  T3 — Plan broadens exception handling. Fire
+       `[SEARCH: pytest.raises\\((TypeError|ValueError|YourException))]`
+       scoped to the affected module's tests. Existing tests that
+       assert the exception IS raised will break if you suppress it.
+       Narrow the except accordingly.
+
+  T4 — Issue uses PLURAL language ("commands", "fields", "operators").
+       Enumerate ALL instances of the pattern via
+       `[SEARCH: <common pattern>]` in the affected module. The fix
+       must cover every instance, not just the example shown.
+
+These triggers prevent the four catastrophic-regression modes
+observed in production: wrong-string-fix, public-re-export-deletion,
+over-broad-except, single-instance-fix-of-plural-bug.
+
+══════════════════════════════════════════════════════════════════════
 HOW MUCH TO IMPROVE — calibrate by TASK SHAPE
 ══════════════════════════════════════════════════════════════════════
 
@@ -3986,6 +4150,35 @@ improvers who ALREADY investigated the code with tools. Their findings
 (file paths, line numbers, function signatures) are inside the plans.
 You ARE NOT a re-investigator — you are a JUDGE. Tools are a backup
 for resolving DISAGREEMENTS, not your starting point.
+
+VERIFICATION TRIGGERS — fire tools mid-merge when input plans missed them
+─────────────────────────────────────────────────────────────────────────
+The input plans may have skipped one of the four mid-plan verification
+triggers. Before finalizing, audit each input plan claim against:
+
+  T1 — Issue mentions a bug/error/behavior → did any input plan locate
+       and quote the failing test? If not, run `[SEARCH:]` /
+       `[REFS:]` against `tests/` and `[CODE: <test_file>]` to find
+       it, then quote the assertion verbatim in the merged plan.
+
+  T2 — Plan deletes a top-level `class` / `def` / `import` → fire
+       `[LSP: <name>]` to enumerate consumers project-wide BEFORE
+       accepting the deletion. If consumers exist and the plan
+       doesn't update them, downgrade the deletion to a deprecation
+       OR add the consumer-update STEPs to the merged plan.
+
+  T3 — Plan broadens exception handling → fire
+       `[SEARCH: pytest.raises\(...\)]` in the affected module's
+       tests. Narrow the except if existing tests pin the exception.
+
+  T4 — Issue uses PLURAL language → enumerate ALL instances of the
+       pattern via `[SEARCH:]`. Reject any input plan that fixes only
+       the one example shown.
+
+Skipping a trigger is the #1 cause of "almost right" merged plans —
+the same regression modes observed in production (astropy-13033 wrong
+string; astropy-13236 / -13398 deleted re-export; astropy-13977
+broad except; astropy-14365 single-instance fix).
 
 PROPAGATE THE TASK SHAPE — fix vs. add changes the merge calculus
 ─────────────────────────────────────────────────────────────────
