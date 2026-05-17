@@ -301,6 +301,20 @@ def search_code(pattern: str, root: str, max_results: int = MAX_SEARCH_RESULTS) 
     """
     Search codebase using ripgrep (rg) or grep fallback.
     Returns list of {file, line_num, line, context}.
+
+    Two-pass strategy to ensure test-file hits are never crowded out:
+      Pass 1: search ONLY in test directories (paths containing /tests/,
+              /test/, or files named test_*.py / *_test.py). Cap at
+              max_results/2 so tests always get top billing in the result.
+      Pass 2: search the whole project as before. Cap at the remaining
+              slots; tests/ hits already returned are deduped.
+
+    Observed failure (astropy-13033): the agent fired a T1 search for
+    the failing test's error-message string. The single-pass scan hit
+    its 30-result cap on irrelevant files (cfitsio docs, the source
+    file itself) BEFORE reaching `astropy/timeseries/tests/test_sampled.py`,
+    where the actual assertion lives. Agent saw "no test matches" → fell
+    back to paraphrasing the bug description → wrong fix.
     """
     root = str(Path(root).resolve())
 
@@ -311,7 +325,31 @@ def search_code(pattern: str, root: str, max_results: int = MAX_SEARCH_RESULTS) 
     for suffix in IGNORE_DIR_SUFFIXES:
         ignore_args.extend(["--glob", f"!*{suffix}/"])
 
-    # Try ripgrep first
+    test_results: list[dict] = []
+    test_quota = max_results // 2 if max_results >= 4 else 0
+
+    # PASS 1 — test directories only
+    if test_quota > 0:
+        try:
+            test_cmd = [
+                "rg", "--line-number", "--no-heading", "--color=never",
+                "--max-count=5",
+                "-C", "5",
+                # Test paths: /tests/ subtrees, test_*.py / *_test.py files
+                "-g", "**/tests/**",
+                "-g", "**/test/**",
+                "-g", "**/test_*",
+                "-g", "**/*_test.*",
+                *ignore_args,
+                pattern, root,
+            ]
+            r = subprocess.run(test_cmd, capture_output=True, text=True, timeout=10)
+            if r.returncode <= 1:
+                test_results = _parse_rg_output(r.stdout, test_quota)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    # PASS 2 — whole project
     try:
         cmd = [
             "rg", "--line-number", "--no-heading", "--color=never",
@@ -324,12 +362,24 @@ def search_code(pattern: str, root: str, max_results: int = MAX_SEARCH_RESULTS) 
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         if result.returncode <= 1:  # 0 = found, 1 = not found
-            return _parse_rg_output(result.stdout, max_results)
+            remaining = max(0, max_results - len(test_results))
+            general = _parse_rg_output(result.stdout, remaining + len(test_results))
+            # De-dup against test_results by (file, line_num)
+            seen_keys = {(r["file"], r["line_num"]) for r in test_results}
+            merged = list(test_results)
+            for item in general:
+                if (item["file"], item["line_num"]) in seen_keys:
+                    continue
+                if len(merged) >= max_results:
+                    break
+                merged.append(item)
+                seen_keys.add((item["file"], item["line_num"]))
+            return merged
     except FileNotFoundError:
         pass  # ripgrep not installed, fall through to grep
     except subprocess.TimeoutExpired:
         warn("Code search timed out")
-        return []
+        return test_results  # at least return what we have from tests pass
 
     # Fallback: grep
     try:
