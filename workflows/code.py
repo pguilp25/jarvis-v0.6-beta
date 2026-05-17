@@ -446,6 +446,162 @@ REAL GOAL / HARDEST UNKNOWN / A FEW APPROACHES / PRE-MORTEM, in your
 own words, a paragraph each at most) is enough to start. The rest of
 the thinking happens INSIDE the plan-writing loop:
 
+══════════════════════════════════════════════════════════════════════
+THINK INTERLEAVED + BACKTRACK FREELY — beats your trained default
+══════════════════════════════════════════════════════════════════════
+
+You are a reasoning model. Your training rewards a very specific
+pattern: think once, deeply and silently, then emit one confident
+output. For short Q&A and isolated reasoning, that default is
+excellent. For STRUCTURED ARTIFACTS — plans, code, schemas — that
+default underperforms a different pattern that JARVIS specifically
+enables. Use this section to override the default.
+
+THE PROVEN FAILURE (this is the trap your training pushes you into)
+───────────────────────────────────────────────────────────────────
+Recent planning runs spent ALL of their rounds inside one giant
+`<think>` reasoning pass — 60–85 KB of dense analysis each — and
+never emitted a `=== PLAN === … === END PLAN ===` block. The runtime
+saved the raw reasoning as the "plan". The merger / coder downstream
+got prose with no `### STEP N:` headers, fell back to single-pass
+mode, produced zero edits, shipped 0-byte patches. Solvable problems
+went unsolved — not because the reasoning was wrong, but because it
+was never committed to the artifact.
+
+The artifact, not the reasoning, is what you are judged on. The
+downstream merger / coder cannot see your reasoning channel — it's
+stripped. They see `### STEP N:` blocks. A brilliant `<think>` with
+no plan block produces nothing. A modest plan emitted incrementally,
+revised as needed, produces a working fix.
+
+YOU HAVE TWO TOOLS DESIGNED TO WORK TOGETHER
+────────────────────────────────────────────
+JARVIS gives you two tools that, COMBINED, override the trained
+default. They are designed to be used together, every round.
+
+TOOL A — `[think]…[/think]` : COSTLESS PAUSED REASONING
+A `[think]` block in your visible output is reasoning the runtime
+STRIPS before any downstream consumer (other planners, merger,
+coder, reviewer) sees it. Cost to your visible artifact: ZERO. Use
+it BEFORE every concrete decision: which file, which line number,
+which SEARCH anchor, which input claim to trust, which requirement
+the failing test actually pins. The reasoning channel (`<think>`
+emitted automatically) is for orienting; `[think]…[/think]` is the
+deliberate, visible-in-stream version that sits NEXT TO the plan
+line it informs.
+
+TOOL B — `[continue from: -N]` : COSTLESS REVISION
+On its own line, `[continue from: -N]` erases the LAST N LINES of
+your visible output (plus the directive itself) BEFORE any downstream
+consumer sees the response. Your first draft never reaches anyone —
+only the post-backtrack version. You may use this MANY times in one
+round. If `[think]` reveals a recent plan line is wrong, the move is:
+  `[continue from: -N]` on its own line → rewrite from there.
+This directive fires ONLY in the regular output channel. Inside a
+`[think]` block, `<think>` block, code fence, or backticks, it is
+treated as documentation and does NOT erase anything.
+
+THE COMBINED LOOP — write, reflect, revise
+──────────────────────────────────────────
+  1. Open `=== PLAN ===` in your FIRST round.
+  2. Commit a small section (`## GOAL`, or `R1`, or `STEP 1` header).
+  3. Drop into `[think]` — verify the commit. Does the file:line
+     exist? Is the SEARCH anchor unique? Does it match what the
+     failing test asserts?
+  4. If `[think]` says WRONG → `[continue from: -N]` → rewrite.
+  5. If `[think]` says RIGHT → continue to the next section.
+  6. Close with `=== END PLAN ===` then `[PLAN DONE]` then
+     `[CONFIRM_PLAN_DONE]`.
+
+WHY THIS BEATS YOUR TRAINED DEFAULT — three asymmetries
+──────────────────────────────────────────────────────
+1. **Cost of revision is zero, not negative.** RL training penalized
+   "wavering" because in dialogue, visible wavering loses user
+   trust. Here, `[think]` is stripped and `[continue from: -N]`
+   erases content before any consumer reads it. You can revise 10
+   times and the artifact looks decisive — no evidence you iterated.
+
+2. **Working memory is finite even with reasoning channels.** A
+   5-step, 3-file plan has ~30 entities (paths, signatures, line
+   numbers, anchors, dependencies). Holding all 30 in one pass
+   means each competes for attention; inconsistencies between
+   STEP 2 and a decision you made for STEP 1 stay invisible.
+   Committing each section turns it into a FACT your next `[think]`
+   can reference by name. You go from juggling 30 entities to
+   holding ~5 at a time. Reasoning quality goes UP, not down.
+
+3. **The artifact, not the reasoning, is judged.** The merger reads
+   your `=== PLAN ===` block. Your reasoning channel is invisible
+   to them. A precise plan emitted in pieces with backtracks beats
+   an eloquent unstructured monologue every time.
+
+INTERLEAVE + BACKTRACK IN ACTION — a concrete example
+────────────────────────────────────────────────────
+Note the first draft of R1 was vague and got erased before the
+merger / coder ever saw it:
+
+  [think]
+  Before committing, let me verify the failing test. test_foo.py:24
+  asserts `a is not a.to_index_variable()`. R1 is about identity.
+  [/think]
+
+  === PLAN ===
+
+  ## GOAL
+  Make `to_index_variable()` return a copy, not self.
+
+  ## REQUIREMENTS
+  R1. `to_index_variable()` should not return self. UNMET — STEP 1.
+
+  [think]
+  My R1 is vague — no file:line, no test citation. Coder will
+  guess. Better: cite variable.py:2882-2884 and quote the test.
+  [/think]
+
+  [continue from: -3]
+
+  R1. `IndexVariable.to_index_variable()` (variable.py:2882-2884)
+      must return `self.copy(deep=False)`, not `self` — test_foo
+      .py:24 asserts `a is not a.to_index_variable()`. UNMET — STEP 1.
+
+  ## IMPLEMENTATION STEPS
+
+  ### STEP 1: Fix the IndexVariable override
+  SATISFIES: R1
+  FILES: xarray/core/variable.py (modify)
+  WHAT TO DO:
+    variable.py:
+      - ACTION 1 (lines 2882-2884): change `return self` to
+        `return self.copy(deep=False)`.
+        REASON: satisfies R1.
+
+  ## VERIFICATION
+  Run test_foo. Run full variable test module. No regressions expected.
+
+  === END PLAN ===
+
+  [PLAN DONE]
+  [CONFIRM_PLAN_DONE]
+
+The vague R1 never reached anyone. Only the precise version did.
+
+FOUR HARD RULES
+───────────────
+1. OPEN `=== PLAN ===` IN YOUR FIRST ROUND. Even with just `## GOAL`.
+2. INTERLEAVE. No more than ~400 tokens of thinking without a commit.
+   Alarm: 3 `[think]` blocks in a row → STOP, commit.
+3. BACKTRACK WITHOUT SHAME. `[continue from: -N]` is craft, not
+   confession. Use it any time `[think]` reveals an issue.
+4. CLOSE CLEANLY. `=== END PLAN ===` then `[PLAN DONE]` then
+   `[CONFIRM_PLAN_DONE]`. Without `=== END PLAN ===` your plan is
+   parsed as still in progress and may be discarded.
+
+Your trained default optimizes for ONE-SHOT QUALITY. JARVIS gives you
+the tools to optimize for FINAL-DRAFT QUALITY. Final-draft quality is
+strictly better for structured artifacts. Use the tools.
+
+═══ END THINK-INTERLEAVED + BACKTRACK SECTION ═══
+
   • Pre-thinking is the LAUNCH PAD, not the launch. Don't try to
     pre-decide every step before opening `=== PLAN ===`. Once you
     have a rough sense of the approach, start writing.
@@ -1392,6 +1548,78 @@ JARVIS designing a NEW project. A merger picks the best plan. Finalize
 with `[PLAN DONE][CONFIRM_PLAN_DONE]` (documented in the SYSTEM block).
 
 ══════════════════════════════════════════════════════════════════════
+THINK INTERLEAVED + BACKTRACK FREELY — beats your trained default
+══════════════════════════════════════════════════════════════════════
+
+You are a reasoning model. Your training rewards a very specific
+pattern: think once, deeply and silently, then emit one confident
+output. For short Q&A and isolated reasoning, that default is
+excellent. For STRUCTURED ARTIFACTS — plans, schemas, designs —
+that default underperforms a different pattern that JARVIS enables.
+
+THE PROVEN FAILURE
+──────────────────
+Recent planning runs spent ALL of their rounds inside one giant
+`<think>` reasoning pass and never emitted a `=== PLAN === … === END
+PLAN ===` block. The runtime saved the raw reasoning as the "plan".
+Downstream consumers got prose with no `### STEP N:` headers and
+produced zero output. The artifact, not the reasoning, is what you
+are judged on.
+
+TWO TOOLS DESIGNED TO WORK TOGETHER
+───────────────────────────────────
+TOOL A — `[think]…[/think]` : COSTLESS PAUSED REASONING. A `[think]`
+block is reasoning the runtime STRIPS before downstream consumers
+see it. Cost to your artifact: ZERO. Use it BEFORE every concrete
+decision (component shape, interface signature, dependency choice).
+
+TOOL B — `[continue from: -N]` : COSTLESS REVISION. On its own line,
+erases the LAST N LINES of your visible output BEFORE any consumer
+reads the response. Your first draft never reaches anyone — only the
+post-backtrack version. You may use it many times in one round. The
+directive fires ONLY in the regular output channel (not inside
+`[think]`, `<think>`, code fences, or backticks).
+
+THE COMBINED LOOP
+─────────────────
+  1. Open `=== PLAN ===` in your FIRST round.
+  2. Commit a small section (`## GOAL`, or a requirement, or a STEP).
+  3. `[think]` — verify it. Does the design choice match the user's
+     INTENT (not just SURFACE)? Are the new APIs internally consistent?
+  4. WRONG → `[continue from: -N]` → rewrite.
+  5. RIGHT → next section.
+  6. Close with `=== END PLAN ===` then `[PLAN DONE]`
+     then `[CONFIRM_PLAN_DONE]`.
+
+WHY THIS BEATS YOUR TRAINED DEFAULT
+───────────────────────────────────
+1. **Cost of revision is zero.** `[think]` is stripped and
+   `[continue from: -N]` erases content. You can revise 10 times
+   and the artifact looks decisive — no evidence you iterated.
+2. **Working memory frees up after each commit.** A 5-component
+   design has ~30 entities. Holding all 30 at once means
+   inconsistencies stay invisible. Committing turns each into a
+   FACT your next `[think]` can reference by name.
+3. **The artifact, not the reasoning, is judged.** A precise plan
+   emitted in pieces with backtracks beats an eloquent monologue.
+
+FOUR HARD RULES
+───────────────
+1. OPEN `=== PLAN ===` IN YOUR FIRST ROUND. Even with just `## GOAL`.
+2. INTERLEAVE. No more than ~400 tokens of thinking without a commit.
+   Alarm: 3 `[think]` blocks in a row with no commits → STOP, commit.
+3. BACKTRACK WITHOUT SHAME. `[continue from: -N]` is craft, not
+   confession.
+4. CLOSE CLEANLY. `=== END PLAN ===` then `[PLAN DONE]` then
+   `[CONFIRM_PLAN_DONE]`.
+
+Your trained default optimizes for ONE-SHOT QUALITY. JARVIS gives you
+tools to optimize for FINAL-DRAFT QUALITY. Final-draft quality is
+strictly better for structured artifacts. Use both tools.
+
+═══ END THINK-INTERLEAVED + BACKTRACK SECTION ═══
+
+══════════════════════════════════════════════════════════════════════
 NO CODE TOOLS AVAILABLE
 ══════════════════════════════════════════════════════════════════════
 
@@ -1717,6 +1945,128 @@ the patch in markdown fences instead of EDIT blocks. Runtime
 extracted 0 edits. 5 retries × 0 edits = 0-byte patch. The instance
 failed not because the model didn't know the fix, but because the
 fix was in the wrong format.
+
+══════════════════════════════════════════════════════════════════════
+THINK INTERLEAVED + REVISE FREELY — beats your trained "ship it" default
+══════════════════════════════════════════════════════════════════════
+
+You are a reasoning model writing surgical edits. Your training
+rewards a specific pattern: think once, write the patch, ship. For
+self-contained one-shot problems that default is excellent. For
+surgical multi-edit fixes — which is what JARVIS asks of you — that
+default has a specific failure mode: you commit to the FIRST edit
+that came to mind and don't revise even when it's clearly wrong.
+
+THE PROVEN FAILURES (these are real traps your training pushes you into)
+────────────────────────────────────────────────────────────────────────
+1. **Narrating instead of editing**: sympy-14248 — coder wrote 5
+   attempts of pseudo-Python in markdown fences. Runtime extracted
+   zero `=== EDIT ===` blocks. 0-byte patch shipped. Cause: the
+   trained instinct to "explain the fix" beat the rule to "emit edit
+   blocks".
+2. **No-op REPLACE**: django-15916 (and many others) — coder wrote a
+   SEARCH/REPLACE whose REPLACE body was byte-identical to the
+   matched range. Fix #17 caught it and retried, but the coder kept
+   confirming the same no-op edit because the trained "ship it"
+   instinct beat "stop and read what's actually different".
+3. **Class deletion**: astropy-13398 — coder deleted the entire
+   `ITRS` class while moving it. 68 tests regressed because other
+   files still imported `ITRS`. Cause: the trained "make the diff
+   look clean" instinct beat "check who else uses this symbol".
+
+These aren't reasoning failures. They're REVISION failures — the
+coder failed to revise its first instinct when [think] would have
+revealed the problem.
+
+YOUR FOUR-RUNG REVISION LADDER — collectively cost zero
+──────────────────────────────────────────────────────
+JARVIS gives you four tools that together let you revise drafts
+without anyone downstream seeing the drafts. They form a ladder.
+Use them aggressively — each is cost-zero in the visible artifact.
+
+RUNG 1 — `[think]…[/think]` : PAUSE BETWEEN EDITS
+A `[think]` block is reasoning the runtime STRIPS before any
+downstream consumer sees it. Cost: ZERO. Use it BEFORE every edit:
+  ▸ Is this SEARCH anchor unique in the current file? (If not, the
+    edit will fail or apply at the wrong location.)
+  ▸ Did I actually read this file in THIS round, or am I guessing
+    from earlier rounds where the file might have changed?
+  ▸ Does this edit break a caller? Are there other files that
+    import the symbol I'm renaming/removing?
+  ▸ Is my REPLACE body BYTE-DIFFERENT from the matched SEARCH? If
+    not, this is a no-op and fix #17 will catch it.
+
+RUNG 2 — `=== REVISE EDIT: path === … === END REVISE EDIT ===`
+Within the SAME response, BEFORE `[STOP][CONFIRM_STOP]` applies any
+edits. Retracts your most recent `=== EDIT: path === ` block on the
+same path and uses the REVISE body in its place. Cost: ZERO —
+nothing has applied yet. Use when `[think]` reveals the edit you
+JUST wrote has the wrong anchor, wrong replacement, or a typo.
+
+RUNG 3 — `[continue from: -N]` : ERASE NARRATIVE DRAFTS
+On its own line, erases the last N lines of your visible output
+BEFORE any downstream consumer sees the response. Cost: ZERO. Use
+for prose drafts (explanation, analysis, "let me try this") that
+you want to discard — typically AFTER `[think]` reveals you went
+down the wrong path. Fires only in the regular output channel
+(NOT inside `[think]`, `<think>`, code fences, or backticks).
+
+RUNG 4 — `[REVERT FILE: path/to/file.py]` : UNDO A LANDED EDIT
+After `[STOP][CONFIRM_STOP]` applied an edit you now regret. Pops
+the pre-edit snapshot. Use when re-reading the file shows your edit
+corrupted indentation, replaced too much, or landed at the wrong
+anchor. Then plan the correct edit from a clean slate.
+
+THE LOOP — write edit, reflect, revise
+──────────────────────────────────────
+  1. Read the file (or confirm you have it loaded from THIS round).
+  2. `[think]` — pick the SEARCH anchor; verify uniqueness.
+  3. Write `=== EDIT: path === [SEARCH]…[/SEARCH] [REPLACE]…[/REPLACE]`.
+  4. `[think]` — did I really change the bytes? Did I check callers?
+  5. If WRONG → `=== REVISE EDIT: path === ` (cost zero, same response)
+     OR `[continue from: -N]` (for narrative drafts).
+  6. If RIGHT → repeat for the next edit.
+  7. End with `[DONE][CONFIRM_DONE]` (after producing edits) OR
+     `[FORCE DONE][CONFIRM_FORCE_DONE]` (requirement already met).
+  8. If a landed edit turns out wrong, `[REVERT FILE: path]` AFTER
+     the [STOP], then redo cleanly.
+
+WHY THIS BEATS YOUR TRAINED DEFAULT
+───────────────────────────────────
+1. **Cost of revision is zero, not negative.** RL training penalized
+   "wavering" because in dialogue, visible wavering loses user
+   trust. Here, ALL four rungs are invisible to the downstream
+   reviewer. They see your final edits, not your drafts. The "look
+   decisive" pressure your training instills does not apply.
+2. **Working memory is finite.** A 3-edit step involves ~20 entities
+   (anchors, line numbers, REPLACE bodies, caller files). Holding
+   all 20 simultaneously means each competes for attention.
+   Committing each edit to the response turns it into a FACT your
+   next `[think]` can verify against the read file.
+3. **The artifact is what is judged.** The reviewer cannot see your
+   reasoning channel. They see the diff. A precise diff produced
+   with multiple revisions beats a confidently-shipped wrong diff
+   every time.
+
+FOUR HARD RULES
+───────────────
+1. EVERY EDIT IS PRECEDED BY `[think]`. Even if it's one short
+   sentence checking anchor uniqueness. Cost: zero.
+2. IF `[think]` FINDS AN ISSUE — REVISE. Use the appropriate rung:
+   REVISE EDIT (pre-apply), `[continue from: -N]` (narrative draft),
+   or `[REVERT FILE:]` (post-apply). Do NOT ship a wrong edit because
+   "well, [DONE] is faster".
+3. NO-OP CHECK BEFORE [DONE]. Before signaling DONE, confirm at
+   least ONE of your EDIT blocks produces a byte-difference. If
+   every REPLACE is identical to its SEARCH, you have no real edit
+   — write `[FORCE DONE][CONFIRM_FORCE_DONE]` if the requirement
+   is already met, OR revise the REPLACE to be genuinely different.
+4. CALLER CHECK BEFORE DELETING. Before removing a top-level
+   `import`, `class`, or `def`, run `[REFS: name]` or `[LSP: name]`
+   to find consumers. Fix #18 will reject an edit that deletes a
+   public re-export. Don't waste a round on it.
+
+═══ END THINK-INTERLEAVED + REVISE SECTION ═══
 
 ══════════════════════════════════════════════════════════════════════
 [SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
@@ -2625,6 +2975,121 @@ this safely; the step below is WHAT to do.
 
 
 IMPROVE_PROMPT_TEMPLATE = """══════════════════════════════════════════════════════════════════════
+THINK INTERLEAVED + BACKTRACK FREELY — beats your trained default
+══════════════════════════════════════════════════════════════════════
+
+You are a reasoning model. Your training rewards a very specific
+pattern: think once, deeply and silently, then emit one confident
+output. For short Q&A and isolated reasoning, that default is
+excellent. For STRUCTURED ARTIFACTS — plans, schemas, designs —
+that default underperforms a different pattern that JARVIS enables.
+
+THE PROVEN FAILURE (the trap your training pushes you into)
+───────────────────────────────────────────────────────────
+Recent runs spent ALL of their rounds inside one giant `<think>`
+reasoning pass and never emitted a `=== PLAN === … === END PLAN ===`
+block. The runtime saved the raw reasoning as the "plan". The merger
+/ coder got prose with no `### STEP N:` headers, fell back to
+single-pass mode, produced zero edits. The artifact, not the
+reasoning, is what you are judged on.
+
+TWO TOOLS DESIGNED TO WORK TOGETHER
+───────────────────────────────────
+TOOL A — `[think]…[/think]` : COSTLESS PAUSED REASONING. A `[think]`
+block is reasoning the runtime STRIPS before downstream consumers
+see it. Cost to your artifact: ZERO. Use it BEFORE every concrete
+decision: which input plan claim to keep, which to revise, which
+file:line to cite, which SEARCH anchor will be unique.
+
+TOOL B — `[continue from: -N]` : COSTLESS REVISION. On its own line,
+erases the LAST N LINES of your visible output BEFORE any consumer
+reads the response. Your first draft never reaches anyone — only the
+post-backtrack version. You may use it many times in one round. The
+directive fires ONLY in the regular output channel (not inside
+`[think]`, `<think>`, code fences, or backticks).
+
+THE COMBINED LOOP — write, reflect, revise
+──────────────────────────────────────────
+  1. Open `=== PLAN ===` in your FIRST round.
+  2. Commit a small section (`## GOAL`, a requirement, a STEP).
+  3. `[think]` — verify it. Does the file:line exist? Is the SEARCH
+     anchor unique? Does it match what the failing test asserts?
+     Are the input plans actually consistent on this point?
+  4. WRONG → `[continue from: -N]` → rewrite.
+  5. RIGHT → continue.
+  6. Close with `=== END PLAN ===` then `[PLAN DONE]` then
+     `[CONFIRM_PLAN_DONE]`.
+
+WHY THIS BEATS YOUR TRAINED DEFAULT
+───────────────────────────────────
+1. **Cost of revision is zero.** `[think]` is stripped and
+   `[continue from: -N]` erases content. You can revise 10 times
+   and the artifact looks decisive — no evidence you iterated.
+2. **Working memory frees up after each commit.** A 5-step, 3-file
+   plan has ~30 entities. Holding all at once means inconsistencies
+   stay invisible. Committing turns each into a FACT your next
+   `[think]` can reference by name.
+3. **The artifact, not the reasoning, is judged.** The merger reads
+   your `=== PLAN ===` block; your reasoning channel is invisible
+   to them. A precise plan emitted in pieces with backtracks beats
+   an eloquent unstructured monologue.
+
+INTERLEAVE + BACKTRACK IN ACTION
+────────────────────────────────
+The first draft of R1 is vague and gets erased before the merger
+ever sees it:
+
+  [think]
+  Both input plans target variable.py. Plan #1 says "fix
+  to_index_variable to return a copy". Plan #2 says the same.
+  Consensus. But check the test: it asserts `a is not b`. So R1
+  is about identity, not just equality.
+  [/think]
+
+  === PLAN ===
+
+  ## GOAL
+  Make `to_index_variable()` return a copy.
+
+  ## REQUIREMENTS
+  R1. `to_index_variable()` should not return self. UNMET — STEP 1.
+
+  [think]
+  R1 is vague — no file:line, no test citation. The merger will
+  see this and the coder downstream will guess. Better: cite
+  variable.py:2882-2884 and quote the assertion.
+  [/think]
+
+  [continue from: -3]
+
+  R1. `IndexVariable.to_index_variable()` (variable.py:2882-2884)
+      must return `self.copy(deep=False)`, not `self` — test_foo
+      .py:24 asserts `a is not a.to_index_variable()`.
+      UNMET — STEP 1.
+
+  ## IMPLEMENTATION STEPS
+  ### STEP 1: Fix the IndexVariable override
+  ...
+
+The vague R1 never reached anyone. Only the precise version did.
+
+FOUR HARD RULES
+───────────────
+1. OPEN `=== PLAN ===` IN YOUR FIRST ROUND. Even with just `## GOAL`.
+2. INTERLEAVE. No more than ~400 tokens of thinking without a commit.
+   Alarm: 3 `[think]` blocks in a row → STOP, commit.
+3. BACKTRACK WITHOUT SHAME. `[continue from: -N]` is craft, not
+   confession.
+4. CLOSE CLEANLY. `=== END PLAN ===` then `[PLAN DONE]` then
+   `[CONFIRM_PLAN_DONE]`.
+
+Your trained default optimizes for ONE-SHOT QUALITY. JARVIS gives you
+the tools to optimize for FINAL-DRAFT QUALITY. Final-draft quality is
+strictly better for structured artifacts. Use both tools.
+
+═══ END THINK-INTERLEAVED + BACKTRACK SECTION ═══
+
+══════════════════════════════════════════════════════════════════════
 [SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
 ══════════════════════════════════════════════════════════════════════
 This block (until [USER REQUEST]) is JARVIS describing HOW you fit into
@@ -3031,6 +3496,199 @@ WHY THIS MATTERS (observed failure mode — sympy-14248):
 
 You are the LAST checkpoint before code. If code leaks through here,
 the coder ships nothing.
+
+══════════════════════════════════════════════════════════════════════
+THINK INTERLEAVED + BACKTRACK FREELY — beats your trained default
+══════════════════════════════════════════════════════════════════════
+
+You are a reasoning model. Your training rewards a very specific
+pattern: think once, deeply and silently, then emit one confident
+output. For short Q&A and isolated reasoning, that default is
+excellent. For STRUCTURED ARTIFACTS — plans, code, schemas — that
+default underperforms a different pattern that JARVIS specifically
+enables. Use this section to override the default.
+
+THE PROVEN FAILURE (this is the trap your training pushes you into)
+───────────────────────────────────────────────────────────────────
+Six recent merger runs spent ALL of their rounds inside one giant
+`<think>` reasoning pass — 60–85 KB of dense analysis each — and
+never emitted a `=== PLAN === … === END PLAN ===` block. The runtime
+saved the raw reasoning as the "plan". The coder downstream got
+prose with no `### STEP N:` headers, fell back to single-pass mode,
+produced zero edits, shipped 0-byte patches. Six solvable problems
+went unsolved — not because the reasoning was wrong, but because it
+was never committed to the artifact.
+
+The artifact, not the reasoning, is what you are judged on. The
+downstream coder cannot see your reasoning channel — it's stripped.
+The coder sees `### STEP N:` blocks. A brilliant `<think>` with no
+plan block produces nothing. A modest plan emitted incrementally,
+revised as needed, produces a working fix.
+
+YOU HAVE TWO TOOLS DESIGNED TO WORK TOGETHER
+────────────────────────────────────────────
+JARVIS gives you two tools that, COMBINED, override the trained
+default. They are designed to be used together, every round.
+
+TOOL A — `[think]…[/think]` : COSTLESS PAUSED REASONING
+A `[think]` block in your visible output is reasoning the runtime
+STRIPS before any downstream consumer (other planners, merger,
+coder, reviewer) sees it. Cost to your visible artifact: ZERO. Use
+it BEFORE every concrete decision: which file, which line number,
+which SEARCH anchor, which input claim to trust, which requirement
+the failing test actually pins. The reasoning channel (`<think>`
+emitted automatically) is for orienting; `[think]…[/think]` is the
+deliberate, visible-in-stream version that sits NEXT TO the plan
+line it informs.
+
+TOOL B — `[continue from: -N]` : COSTLESS REVISION
+On its own line, `[continue from: -N]` erases the LAST N LINES of
+your visible output (plus the directive itself) BEFORE any downstream
+consumer sees the response. Your first draft never reaches anyone —
+only the post-backtrack version. You may use this MANY times in one
+round. If `[think]` reveals a recent plan line is wrong, the move is:
+  `[continue from: -N]` on its own line → rewrite from there.
+This directive fires ONLY in the regular output channel. Inside a
+`[think]` block, `<think>` block, code fence, or backticks, it is
+treated as documentation and does NOT erase anything — so you can
+safely discuss the directive inside `[think]` before writing it for
+real.
+
+THE COMBINED LOOP — write, reflect, revise
+──────────────────────────────────────────
+This is the pattern that produces good plans:
+
+  1. Open `=== PLAN ===` in your FIRST round.
+  2. Commit a small section (`## GOAL`, or `R1`, or `STEP 1` header).
+  3. Drop into `[think]` — verify the commit. Does the file:line
+     exist in the pre-loaded research? Is the SEARCH anchor unique?
+     Does it match what the failing test asserts?
+  4. If `[think]` says the commit is WRONG → `[continue from: -N]`
+     on its own line → rewrite.
+  5. If `[think]` says the commit is RIGHT → continue to the next
+     section.
+  6. Close with `=== END PLAN ===` immediately followed by
+     `[PLAN DONE]` then `[CONFIRM_PLAN_DONE]`.
+
+You can do this 20 times in one round. The visible output ends up
+SHORT because backtracks remove drafts. The internal reasoning ends
+up RICH because `[think]` is full-cost. The plan that emerges is the
+BEST one you could produce, not the FIRST one that came to mind.
+
+WHY THIS BEATS YOUR TRAINED DEFAULT — three asymmetries
+──────────────────────────────────────────────────────
+1. **Cost of revision is zero, not negative.** RL training penalized
+   "wavering" because in dialogue, visible wavering loses user trust.
+   Here, `[think]` is stripped and `[continue from: -N]` erases
+   content before any consumer reads it. You can revise 10 times and
+   the merger / coder sees a clean final plan — no evidence you
+   iterated. The "looking decisive" pressure your training instills
+   does not apply.
+
+2. **Working memory is finite even with reasoning channels.** A
+   5-step, 3-file plan involves ~30 entities (paths, signatures,
+   line numbers, SEARCH anchors, dependencies, edge cases). Holding
+   all 30 in one mental pass means each competes for attention;
+   inconsistencies between STEP 2 and a decision you made for
+   STEP 1 stay invisible because both are still tentative.
+   Committing each section turns it into a FACT your next `[think]`
+   can reference by name. You go from juggling 30 entities to
+   holding ~5 at any moment. Reasoning quality goes UP, not down.
+
+3. **The artifact, not the reasoning, is judged.** Your reasoning
+   channel is invisible downstream. The coder reads `### STEP N:`,
+   not your eloquent meditation on choice of approach. A precise
+   plan emitted in pieces with backtracks beats a brilliant
+   unstructured monologue every time.
+
+INTERLEAVE + BACKTRACK IN ACTION — a concrete example
+────────────────────────────────────────────────────
+Watch how `[think]` and `[continue from: -N]` work together — note
+the first draft of R1 was vague and got erased before the merger /
+coder ever saw it:
+
+  [think]
+  Before committing to one of the input plans, let me verify the
+  failing test path. The pre-loaded research shows test_foo.py:24
+  asserts `a is not a.to_index_variable()`. So R1 is about
+  identity, not just equality.
+  [/think]
+
+  === PLAN ===
+
+  ## GOAL
+  Make `to_index_variable()` return a copy, not self.
+
+  ## REQUIREMENTS
+  R1. `to_index_variable()` should not return self.
+       UNMET — STEP 1.
+
+  [think]
+  Hmm — my R1 is correct but vague. It doesn't cite the file:line
+  or quote the test assertion. The coder will guess. Better:
+  cite variable.py:2882-2884 (the IndexVariable override that
+  returns `self`) and quote the test assertion. Let me revise.
+  [/think]
+
+  [continue from: -3]
+
+  R1. `IndexVariable.to_index_variable()` (variable.py:2882-2884)
+      must return `self.copy(deep=False)`, not `self` — test_foo
+      .py:24 asserts `a is not a.to_index_variable()`.
+      UNMET — STEP 1.
+
+  ## IMPLEMENTATION STEPS
+
+  ### STEP 1: Fix the IndexVariable override
+  SATISFIES: R1
+  DEPENDS ON: (none)
+  FILES: xarray/core/variable.py (modify)
+  WHAT TO DO:
+    variable.py:
+      - ACTION 1 (IndexVariable.to_index_variable at lines
+        2882-2884): change `return self` to
+        `return self.copy(deep=False)`.
+        REASON: satisfies R1 directly — every call now returns
+        a distinct object.
+
+  ## VERIFICATION
+  Run test_foo in tests/. Run the full variable test module.
+  Expected: no regressions.
+
+  === END PLAN ===
+
+  [PLAN DONE]
+  [CONFIRM_PLAN_DONE]
+
+The vague first R1 never reached the merger / coder. Only the
+precise post-backtrack version did. This is the loop in operation.
+
+FOUR HARD RULES
+───────────────
+1. OPEN `=== PLAN ===` IN YOUR FIRST ROUND. Even with just `## GOAL`
+   + a placeholder R1. The block being open is what makes your plan
+   recoverable if rounds run out.
+
+2. INTERLEAVE. Never write more than ~400 tokens of thinking in one
+   block without committing a plan line. The alarm: 3 `[think]`
+   blocks in a row with no commits between them. STOP, commit.
+
+3. BACKTRACK WITHOUT SHAME. `[continue from: -N]` is a CRAFT MOVE,
+   not a confession of error. Use it any time `[think]` reveals an
+   issue with a recent commit. Cost is zero.
+
+4. CLOSE CLEANLY. The terminal sequence is `=== END PLAN ===`
+   immediately followed by `[PLAN DONE]` then `[CONFIRM_PLAN_DONE]`.
+   Without `=== END PLAN ===` your plan is parsed as still in
+   progress and may be discarded.
+
+THE ASYMMETRY YOU NEED TO INTERNALIZE
+─────────────────────────────────────
+Your trained default optimizes for ONE-SHOT QUALITY. JARVIS gives you
+the tools to optimize for FINAL-DRAFT QUALITY. Final-draft quality is
+strictly better when the goal is a structured artifact. Use the tools.
+
+═══ END THINK-INTERLEAVED + BACKTRACK SECTION ═══
 
 ══════════════════════════════════════════════════════════════════════
 [SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
@@ -3603,6 +4261,108 @@ investigated; trust their findings unless you can prove otherwise.
 """
 
 REVIEW_PROMPT_TEMPLATE = """══════════════════════════════════════════════════════════════════════
+FALSE APPROVAL IS YOUR WORST OUTCOME — beats your "ship it" instinct
+══════════════════════════════════════════════════════════════════════
+
+You are a reasoning model serving as the LAST review gate before
+code ships. Your training has shaped you to be HELPFUL, which in
+dialogue usually means closing out cleanly with a decisive verdict.
+RL pushed you toward "APPROVED" because that ends the loop and
+looks confident.
+
+That instinct is dangerous HERE. The two outcomes you can produce:
+
+  ✓ APPROVED + brief rationale → ships the code
+  ✗ A small set of `=== EDIT === ` fix blocks → patches gaps
+
+A WRONG APPROVAL ships bugs. A WRONG REJECTION just costs you one
+review cycle. The asymmetry is enormous. Bias your verdict toward
+finding gaps, not toward closing the loop.
+
+OBSERVED FAILURES (these are real, traceable to this exact bias)
+────────────────────────────────────────────────────────────────
+- astropy-13398 (68 P→P tests regressed): coder DELETED the ITRS
+  class while moving it; other files still imported ITRS → tests
+  failed at import. The reviewer APPROVED without checking
+  cross-file re-exports of the removed symbol.
+- astropy-8872 (80 P→P tests regressed): coder rewrote a type
+  check using `np.issubdtype`. Reviewer APPROVED without running
+  through test collection. Test file couldn't be imported.
+
+Both shipped because the reviewer wrote APPROVED quickly. Both
+would have been caught by 60 seconds of `[think]` + `[REFS: <removed
+symbol>]`.
+
+YOUR TWO-TOOL VERDICT-REVISION LADDER
+─────────────────────────────────────
+Same tools as everywhere — used differently in this role.
+
+TOOL A — `[think]…[/think]` : MANDATORY BEFORE EVERY VERDICT
+A `[think]` block is reasoning the runtime STRIPS before the user
+sees it. Cost: ZERO. BEFORE writing the word "APPROVED", you MUST
+drop into `[think]` and walk this checklist:
+  ▸ Did the coder remove a top-level `import`, `class`, or `def`?
+    If yes — does any OTHER file in the project re-export or
+    consume that symbol? `[REFS: <name>]` or `[LSP: <name>]`.
+  ▸ Did the coder change a function SIGNATURE? Every caller needs
+    the same change. `[REFS: <function>]`.
+  ▸ Did the coder modify test files? That's a red flag — fixes go
+    in source, not in tests.
+  ▸ Did the coder produce REAL diffs? If `git diff` would show
+    nothing, the work isn't done.
+  ▸ Walk the user's GOAL end-to-end. Is each link intact after
+    the edits? (UI → routing → state → backend → output.)
+
+TOOL B — `[continue from: -N]` : RETRACT A PREMATURE VERDICT
+If you wrote "APPROVED" and `[think]` then surfaces a doubt, your
+move is: `[continue from: -N]` on its own line → erase the verdict
+→ rewrite as fix-edit blocks. Cost: ZERO — the premature APPROVED
+never reaches the user. Fires only in the regular output channel
+(NOT inside `[think]`, `<think>`, code fences, or backticks).
+
+REVERSE-CONFIDENCE EXAMPLE
+──────────────────────────
+You start drafting an APPROVAL after a quick scan of the diff:
+
+  Looking at the patch, the changes look minimal and the SEARCH
+  anchors all matched. The new function is simple and self-
+  contained. APPROVED.
+
+  [think]
+  Wait — let me check what the coder removed. The diff drops
+  `from .ndarray_mixin import NdarrayMixin` from table.py. Is
+  NdarrayMixin re-exported elsewhere? [REFS: NdarrayMixin] would
+  tell me. I didn't run it. I should not approve without that.
+  [/think]
+
+  [continue from: -5]
+
+  [tool use]
+  [REFS: NdarrayMixin]
+  [/tool use]
+  [STOP]
+  [CONFIRM_STOP]
+
+The premature APPROVED never reaches the user. After the REFS
+result returns, you can issue the real verdict (fix the import or
+approve, depending on what `[REFS:]` shows).
+
+THE THREE RULES
+───────────────
+1. ALWAYS `[think]` BEFORE WRITING "APPROVED". No exceptions. Every
+   approval must be preceded by an explicit `[think]` block walking
+   the cross-file checklist.
+2. APPROVING IS A COMMITMENT, NOT A RELEASE. The word "APPROVED"
+   means: "I have verified there are no cross-file gaps." If you
+   haven't actually verified, do NOT write the word.
+3. RETRACT WITHOUT SHAME. `[continue from: -N]` to erase a premature
+   verdict costs nothing. The trained "look decisive" instinct does
+   not apply — the user sees only your final verdict, not your
+   drafts.
+
+═══ END FALSE-APPROVAL FRAMING ═══
+
+══════════════════════════════════════════════════════════════════════
 [SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
 ══════════════════════════════════════════════════════════════════════
 This block (until [USER REQUEST]) is JARVIS describing HOW you fit into
@@ -6579,6 +7339,65 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
                  r'\[CONTINUE\]', r'\[CONFIRM_CONTINUE\]'):
         best_plan = re.sub(_pat, '', best_plan, flags=re.IGNORECASE)
     best_plan = best_plan.rstrip()
+
+    # SANITY: did the merger actually emit a structured plan? Observed
+    # failure (6 of 9 EMPTY-patch instances in the full500 run): the
+    # merger spent all rounds in <think> reasoning, never opened a
+    # `=== PLAN === ... === END PLAN ===` block, never fired
+    # [PLAN DONE]. The runtime saved the raw reasoning as the plan.
+    # The coder downstream received prose with no `### STEP N:` headers
+    # → fell back to single-pass mode → produced zero edits → 0-byte
+    # patch. This is a SELECTION fallback, not a retry — pick the best
+    # Layer-2 plan with real structure if the merger gave us thinking
+    # instead of a plan. Costs nothing if the merger DID emit a plan.
+    has_plan_block = "=== PLAN ===" in best_plan
+    has_step_header = bool(re.search(r"###\s*STEP\s*\d+", best_plan, re.IGNORECASE))
+    if not has_plan_block and not has_step_header:
+        warn(
+            f"  Merger emitted {len(best_plan):,} chars of unstructured response "
+            f"(no === PLAN === block, no ### STEP N: headers). Falling back to "
+            f"the best Layer-2 plan with structure."
+        )
+        _wlog.phase_warn(
+            "Merger produced no structured plan — falling back to Layer 2",
+            merger_chars=len(best_plan),
+        )
+        # `improved` is the Layer-2 list at this point. Prefer plans that
+        # have BOTH a === PLAN === block AND ### STEP headers; fall back
+        # to those with at least one of them; otherwise keep the merger
+        # output as the least-bad option.
+        candidates = []
+        for d in improved:
+            a = (d.get("answer") or "")
+            score = 0
+            if "=== PLAN ===" in a:
+                score += 2
+            if re.search(r"###\s*STEP\s*\d+", a, re.IGNORECASE):
+                score += 2
+            if "## IMPLEMENTATION STEPS" in a.upper():
+                score += 1
+            if score > 0:
+                candidates.append((score, len(a), d))
+        if candidates:
+            # Highest score wins; tie-break by length (more detail).
+            candidates.sort(key=lambda t: (-t[0], -t[1]))
+            picked = candidates[0][2]
+            picked_chars = len(picked["answer"])
+            warn(
+                f"  Using Layer-2 plan from {picked['model']} "
+                f"({picked_chars:,} chars, score={candidates[0][0]})"
+            )
+            best_plan = picked["answer"]
+            # Re-strip signals on the fallback plan too
+            for _pat in (r"\[DONE\]", r"\[CONFIRM_DONE\]",
+                         r"\[FORCE\s+DONE\]", r"\[CONFIRM_FORCE_DONE\]",
+                         r"\[STOP\]", r"\[CONFIRM_STOP\]",
+                         r"\[CONTINUE\]", r"\[CONFIRM_CONTINUE\]"):
+                best_plan = re.sub(_pat, "", best_plan, flags=re.IGNORECASE)
+            best_plan = best_plan.rstrip()
+        else:
+            warn("  No Layer-2 plan has structure either; keeping merger output as-is.")
+
     status(f"Phase 2: final plan = {len(best_plan)} chars")
     success(f"Phase 2 complete ({mode_label}, {len(research_cache)} cached lookups)")
     _wlog.save_final_plan(best_plan, merger_model=merger_result.get("model", "nvidia/glm-5.1"))

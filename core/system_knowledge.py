@@ -393,6 +393,38 @@ LSP vs REFS — they complement, don't substitute:
   definitive site; REFS to catch text-only callers LSP cannot see.
 
 ────────────────────────────────────────────────────────────────────
+THINK INTERLEAVED + REVISE FREELY — a universal habit
+────────────────────────────────────────────────────────────────────
+Your trained default — think once silently, then emit one confident
+output — is optimal for short Q&A and bad for structured artifacts.
+For plans / edits / verdicts in JARVIS, the better pattern is:
+  ▸ commit a small piece of the artifact
+  ▸ drop into `[think]…[/think]` to verify it
+  ▸ if wrong, revise with the role's revision tools (cost zero —
+    `[think]` is stripped and revisions erase drafts before
+    anything downstream reads them)
+  ▸ continue with the next piece
+
+The tools that make this cost-zero:
+  • `[think]…[/think]` — paused reasoning, stripped before downstream
+    consumers read the response
+  • `[continue from: -N]` — erases the last N lines of your visible
+    output before the response is parsed
+  • Role-specific tools (`=== REVISE EDIT ===`, `[REVERT FILE:]`,
+    `=== PLAN_EDIT ===`) — documented in your role prompt
+
+WHY this beats the trained default: the artifact, not the reasoning
+trail, is what downstream consumers see. You can revise 10 times
+and the artifact looks decisive — no evidence you iterated. The "be
+decisive in dialogue" reflex your training instilled does not apply
+because nothing downstream reads your drafts.
+
+Your role prompt has the role-tailored version (planner, coder,
+reviewer) with concrete examples and the specific revision tools
+that apply to your artifact. Use them aggressively. Skip the
+artifact-first commit and you risk producing nothing.
+
+────────────────────────────────────────────────────────────────────
 SIGNAL PROTOCOL — two-tag combinations (READ CAREFULLY)
 ────────────────────────────────────────────────────────────────────
 The runtime uses TWO-TAG signal combinations for control flow. Each
