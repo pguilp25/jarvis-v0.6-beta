@@ -6221,6 +6221,33 @@ def _apply_revise_edits(response: str) -> str:
         response = response[:r_start] + new_edit + response[r_end:]
 
 
+def _mask_inert_zones(text: str) -> str:
+    """Mask content inside zones where edit syntax must be INERT — the model
+    sometimes writes example edit blocks inside `[think]` reasoning or
+    fenced code blocks (```...```) to explain or compare options. Those
+    must NOT be extracted as real edits.
+
+    Replaces inner content with same-length whitespace so positions don't
+    shift; newlines are preserved so line numbers stay correct.
+    """
+    def _blank(match):
+        return ''.join(c if c == '\n' else ' ' for c in match.group(0))
+
+    # `[think]...[/think]` — JARVIS-prompted explicit thinking marker
+    text = re.sub(
+        r'\[think\][\s\S]*?\[/think\]',
+        _blank, text, flags=re.IGNORECASE,
+    )
+    # `<think>...</think>` — model's native reasoning channel rendered
+    text = re.sub(
+        r'<think>[\s\S]*?</think>',
+        _blank, text, flags=re.IGNORECASE,
+    )
+    # Triple-backtick fenced blocks — model may quote syntax for docs
+    text = re.sub(r'```[\s\S]*?```', _blank, text)
+    return text
+
+
 def _extract_code_blocks(response: str) -> dict:
     """
     Extract edits and new files from AI response.
@@ -6233,6 +6260,12 @@ def _extract_code_blocks(response: str) -> dict:
         "new_files": {filepath: content},
     }
     """
+    # MASK INERT ZONES first — edit syntax inside [think]/<think>/fenced
+    # blocks must NOT be extracted. The model writes example edit blocks
+    # inside reasoning to discuss options; treating those as real edits
+    # ships wrong patches.
+    response = _mask_inert_zones(response)
+
     # Resolve any `=== REVISE EDIT: path === ... === END REVISE EDIT ===`
     # blocks first. Each REVISE block discards the most recent prior EDIT
     # on the same path and is itself promoted to a regular EDIT block,
@@ -8112,18 +8145,27 @@ def _extract_impl_steps(plan: str) -> list[dict]:
     # `## IMPLEMENTATION STEPS` heading, not the first. (An earlier draft
     # ending mid-step would otherwise overwrite the final plan, dropping
     # whichever steps appeared only in the final.)
-    # Find the LAST ## IMPLEMENTATION STEPS heading and capture from there
-    # to end of string. Do NOT stop at any ## heading — step bodies often
-    # contain ## headers as template content (e.g. "## BUGS" inside a prompt
-    # format spec), and stopping at those drops subsequent steps silently.
-    # Step boundaries are identified by ### STEP N: headers, not ## sections.
-    section_matches = list(re.finditer(
-        r'##\s*IMPLEMENTATION\s+STEPS\s*\n(.*)',
-        plan, re.DOTALL | re.IGNORECASE,
-    ))
-    if section_matches:
-        # Use the last (latest, most complete) draft
-        plan_scoped = section_matches[-1].group(1)
+    # Find the LAST `## IMPLEMENTATION STEPS` header and capture from there
+    # to end of string. The merger sometimes drafts a plan then rewrites it
+    # in the same response — the LAST occurrence is the final draft.
+    # Do NOT stop at downstream ## headers — step bodies often contain
+    # `## SECTION` as template content (e.g. "## BUGS" inside a prompt
+    # format spec). Step boundaries are identified by `### STEP N:` headers,
+    # not by `## SECTION` headers.
+    #
+    # NOTE: previous implementation used a single greedy `.*` regex which
+    # matched only ONCE (consuming everything from the FIRST header to EOF),
+    # so the "use the last" intent was silently broken. Find header
+    # positions directly instead.
+    header_pat = re.compile(
+        r'##\s*IMPLEMENTATION\s+STEPS\s*\n',
+        re.IGNORECASE,
+    )
+    header_positions = [m.end() for m in header_pat.finditer(plan)]
+    if header_positions:
+        # Use the LAST header position — everything after that is the
+        # final draft of the implementation steps section.
+        plan_scoped = plan[header_positions[-1]:]
     else:
         plan_scoped = plan
 
