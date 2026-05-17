@@ -76,6 +76,14 @@ STOP_TAG = re.compile(r'\[STOP\]\s*\[CONFIRM_STOP\]', re.IGNORECASE)
 # DONE signals the model is completely finished — apply edits and exit.
 # Same two-tag-combination robustness as STOP.
 DONE_TAG = re.compile(r'\[DONE\]\s*\[CONFIRM_DONE\]', re.IGNORECASE)
+# FORCE DONE — used by the coder when the step requirement is ALREADY MET
+# in the file and no edits are needed. Plain [DONE] without any edits
+# triggers a retry (the coder might just have forgotten to emit edits);
+# [FORCE DONE] is the explicit "I am intentionally producing no edits"
+# escape hatch. Same two-tag protocol.
+FORCE_DONE_TAG = re.compile(
+    r'\[FORCE\s+DONE\]\s*\[CONFIRM_FORCE_DONE\]', re.IGNORECASE,
+)
 # CONTINUE signals "I'm not done writing my output but I have no tool
 # calls — give me another round so I can finish." Used when a long plan,
 # review, or analysis would overflow a single response. The runtime
@@ -89,6 +97,9 @@ CONTINUE_TAG = re.compile(r'\[CONTINUE\]\s*\[CONFIRM_CONTINUE\]', re.IGNORECASE)
 _BARE_STOP = re.compile(r'(?<!\[)\[STOP\](?!\s*\[CONFIRM_STOP\])', re.IGNORECASE)
 _BARE_DONE = re.compile(r'(?<!\[)\[DONE\](?!\s*\[CONFIRM_DONE\])', re.IGNORECASE)
 _BARE_CONTINUE = re.compile(r'(?<!\[)\[CONTINUE\](?!\s*\[CONFIRM_CONTINUE\])', re.IGNORECASE)
+_BARE_FORCE_DONE = re.compile(
+    r'(?<!\[)\[FORCE\s+DONE\](?!\s*\[CONFIRM_FORCE_DONE\])', re.IGNORECASE,
+)
 _BARE_PLAN_DONE = re.compile(
     r'(?<!\[)\[PLAN\s+DONE\](?!\s*\[CONFIRM_PLAN_DONE\])', re.IGNORECASE,
 )
@@ -2063,6 +2074,7 @@ _ALL_TAGS = re.compile(
     r'\[(SEARCH|WEBSEARCH|DETAIL|CODE|REFS|PURPOSE|LSP|KNOWLEDGE|KEEP|DISCARD):\s*.+?\]'
     r'|\[STOP\]\s*\[CONFIRM_STOP\]'
     r'|\[DONE\]\s*\[CONFIRM_DONE\]'
+    r'|\[FORCE\s+DONE\]\s*\[CONFIRM_FORCE_DONE\]'
     r'|\[CONTINUE\]\s*\[CONFIRM_CONTINUE\]',
     re.IGNORECASE,
 )
@@ -2101,7 +2113,9 @@ def _autocomplete_tool_blocks(text: str) -> tuple[str, int]:
     # first boundary AFTER the open (next open / next signal / end-of-text).
     BoundaryRe = re.compile(
         r'\[tool use\]|\[/tool use\]|\[STOP\]\s*\[CONFIRM_STOP\]'
-        r'|\[DONE\]\s*\[CONFIRM_DONE\]|\[CONTINUE\]\s*\[CONFIRM_CONTINUE\]',
+        r'|\[DONE\]\s*\[CONFIRM_DONE\]'
+        r'|\[FORCE\s+DONE\]\s*\[CONFIRM_FORCE_DONE\]'
+        r'|\[CONTINUE\]\s*\[CONFIRM_CONTINUE\]',
         re.IGNORECASE,
     )
     insertions: list[int] = []
@@ -2250,12 +2264,19 @@ async def call_with_tools(
     research_cache: shared dict that accumulates all lookup results across
     multiple AI calls. Same tag won't re-run if cached.
 
-    Returns {"model": str, "answer": str, "done": bool, "research": {tag_key: result}}.
+    Returns {"model": str, "answer": str, "done": bool, "force_done": bool,
+    "research": {tag_key: result}}.
     "done" is True when the model explicitly wrote [DONE] — it is NOT present in
     "answer" (stripped before return), so callers must check this flag, not the text.
+    "force_done" is True when the model wrote [FORCE DONE][CONFIRM_FORCE_DONE] —
+    the coder's escape hatch for "step requirement already met, no edits needed".
+    When force_done is True, done is also True. The IMPLEMENT loop uses
+    force_done to distinguish "I am intentionally producing no edits" from
+    "I forgot to produce edits", which otherwise trigger a retry.
     """
     full_response = ""
     _done_signaled = False
+    _force_done_signaled = False
     current_prompt = prompt
 
     # [SEARCH:] and [REFS:] use ripgrep on project_root, but ripgrep respects
@@ -2362,6 +2383,8 @@ async def call_with_tools(
         # entirely. The lighter mask still protects against backtick /
         # fenced-block discussion of the syntax.
         masked = _mask_for_signals(accumulated)
+        if FORCE_DONE_TAG.search(masked):
+            return True
         if DONE_TAG.search(masked):
             return True
         if STOP_TAG.search(masked):
@@ -2527,6 +2550,26 @@ async def call_with_tools(
                 cur_e = e - bridge_offset
                 result = result[:cur_s] + result[cur_e:]
             return True
+
+        # ── FORCE DONE: step requirement already met, no edits needed ─
+        # Must be checked BEFORE DONE_TAG because `[FORCE DONE]` shouldn't
+        # also be eaten by the DONE handler. Implies _done_signaled — the
+        # round terminates either way — but ALSO sets _force_done_signaled
+        # so the IMPLEMENT loop knows not to retry on "zero edits".
+        if _signal_in_bridge(FORCE_DONE_TAG):
+            _consume_bridge_signal(FORCE_DONE_TAG)
+            while _signal_in_bridge(DONE_TAG):
+                _consume_bridge_signal(DONE_TAG)
+            while _signal_in_bridge(STOP_TAG):
+                _consume_bridge_signal(STOP_TAG)
+            while _signal_in_bridge(CONTINUE_TAG):
+                _consume_bridge_signal(CONTINUE_TAG)
+            result = result.rstrip()
+            _round_texts.append(result)
+            full_response += result
+            _done_signaled = True
+            _force_done_signaled = True
+            break
 
         # ── DONE: finish the loop ─────────────────────────────────────
         if _signal_in_bridge(DONE_TAG):
@@ -2753,7 +2796,8 @@ async def call_with_tools(
                 # [PLAN DONE] alone if half-arrived during streaming).
                 _answer = re.sub(
                     r'\[(?:PLAN\s+DONE|CONFIRM_PLAN_DONE|STOP|CONFIRM_STOP|'
-                    r'DONE|CONFIRM_DONE|CONTINUE|CONFIRM_CONTINUE)\]',
+                    r'DONE|CONFIRM_DONE|FORCE\s+DONE|CONFIRM_FORCE_DONE|'
+                    r'CONTINUE|CONFIRM_CONTINUE)\]',
                     '', _answer, flags=re.IGNORECASE,
                 ).strip()
                 _src = "raw-prose plan (no === PLAN === block used)"
@@ -2798,9 +2842,11 @@ async def call_with_tools(
             # double-count [STOP] inside [STOP][CONFIRM_STOP] as bare.
             _mask_bare = STOP_TAG.sub('', _mask_bare)
             _mask_bare = DONE_TAG.sub('', _mask_bare)
+            _mask_bare = FORCE_DONE_TAG.sub('', _mask_bare)
             _mask_bare = CONTINUE_TAG.sub('', _mask_bare)
             if (_BARE_STOP.search(_mask_bare)
                     or _BARE_DONE.search(_mask_bare)
+                    or _BARE_FORCE_DONE.search(_mask_bare)
                     or _BARE_CONTINUE.search(_mask_bare)):
                 _suspected_bare_signal = True
 
@@ -3571,9 +3617,10 @@ async def call_with_tools(
                 # commit can leak `[CONFIRM_DONE]` / `[STOP]` text into the
                 # final answer, which downstream regex (e.g. _extract_code_blocks
                 # consumed_spans) doesn't expect.
-                for _pat in (DONE_TAG, STOP_TAG, CONTINUE_TAG):
+                for _pat in (FORCE_DONE_TAG, DONE_TAG, STOP_TAG, CONTINUE_TAG):
                     final_result = _pat.sub('', final_result)
                 for _half in (
+                    r'\[CONFIRM_FORCE_DONE\]', r'\[FORCE\s+DONE\]',
                     r'\[CONFIRM_DONE\]', r'\[DONE\]',
                     r'\[CONFIRM_STOP\]', r'\[STOP\]',
                     r'\[CONFIRM_CONTINUE\]', r'\[CONTINUE\]',
@@ -4327,6 +4374,7 @@ round's results — what changed? Then either:
         "model": model,
         "answer": full_response,
         "done": _done_signaled,
+        "force_done": _force_done_signaled,
         "research": local_research,
         # `persistent_lookups` reflects the FINAL view the model had: CODE
         # entries replaced by their KEEP-filtered version, DISCARDed entries

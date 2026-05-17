@@ -45,6 +45,7 @@ import asyncio
 import os
 import re
 import subprocess
+from pathlib import Path
 from core.retry import call_with_retry
 from core.tool_call import call_with_tools as _call_with_tools
 from core.state import AgentState
@@ -144,12 +145,42 @@ THEN INVESTIGATE — before EVERY tool round, write a short OPEN QUESTIONS
 list. Each tool call must cite the Q it answers. If you can't name a
 question, you have no questions: write the map.
 
-INVESTIGATION ORDER (escalate only if the cheaper tool was insufficient):
-  • [REFS: name]  — find a definition / its callers (CHEAP — prefer this)
-  • [CODE: path]  — read the file (use sparingly; large files cost tokens)
-  • [KEEP: path N-M] — after [CODE:], strip to the lines you actually need
-  • [SEARCH: pattern] — text search across the codebase
-  • [DETAIL: section] — pre-built code map for a subsystem
+INVESTIGATION ORDER (pick the cheapest tool that answers the question):
+  • [LSP: name]    — semantic lookup for a specific method/class/function
+                     via a language server. Returns canonical definition
+                     site + every reference + type info. NO truncation.
+                     Knows about method overrides and re-exports.
+                     Use when the issue names a specific symbol and you
+                     need its definition site before patching.
+  • [REFS: name]   — ripgrep word-boundary search for an identifier.
+                     Returns DEFINED + IMPORTED + USED buckets.
+                     Definitions are always preserved (priority pass);
+                     USED capped at 30. Catches text-only matches
+                     (string literals, comments, magic constants) that
+                     LSP cannot see.
+  • [PURPOSE: cat] — expand a category from the Phase-1 purpose map (the
+                     AI-built code-categorization scan). Returns every
+                     file/line range in that category. Use when
+                     investigating BY INTENT, not by symbol name.
+  • [SEMANTIC: q]  — fuzzy match over the purpose categories. Use when
+                     you want PURPOSE but don't know the exact name.
+  • [CODE: path]   — read the FULL file (use sparingly; large files
+                     return a skeleton + you follow up with [VIEW:]).
+  • [VIEW: path L] — read ~200 lines around line L in a large file
+                     ([CODE:] returned a skeleton).
+  • [KEEP: path N-M] — after [CODE:], strip context to those lines.
+  • [SEARCH: pat]  — ripgrep regex/text search (use for non-symbol
+                     patterns like error messages, magic strings).
+  • [DETAIL: section] — pre-built code map for a feature subsystem.
+  • [WEBSEARCH: q] — external API / library docs.
+
+  RULE: any method name you cite in a STEP body MUST have its
+  definition inspected via [LSP: name], [REFS: name], or [CODE:
+  <its_file>] before you decide which file to patch. Patching a caller
+  without reading the callee is how plans land on the wrong file
+  (observed: xarray-6938 patched dataset.py's `swap_dims` when the bug
+  was in variable.py's `to_index_variable` method itself — the planner
+  never inspected `to_index_variable`).
 
 Start with names mentioned in the task, then follow the call chain.
 Batch your tool calls — one big batch beats five small rounds.
@@ -192,13 +223,65 @@ without firing the tool loop accidentally.
 Writing [CODE:] or [REFS:] outside a [tool use] block does nothing.
 Add #label to name results. [DISCARD: #label] to remove irrelevant ones.
 
-  [REFS: name]         All definitions, imports, call sites for an identifier
-  [LSP: name]          Type info, inheritance, method signatures
+  ── Symbol lookups ────────────────────────────────────────────────
+  [REFS: name]         Ripgrep word-boundary search for an identifier
+                       across the project. Returns DEFINED + IMPORTED
+                       + USED buckets. Definitions are always preserved
+                       (priority pass — never truncated). USED entries
+                       capped at 30. Catches text-only matches (string
+                       literals, comments, magic constants) that LSP
+                       cannot see.
+
+  [LSP: name]          Semantic symbol resolution via a language server
+                       (pylsp / clangd / tsserver / rust-analyzer /
+                       gopls / …). Returns canonical definition + every
+                       reference + type info / hover. NO truncation.
+                       Knows method overrides, re-exports, inheritance.
+                       Falls back to REFS if no LSP server is installed
+                       for the project's language.
+
+                       REFS vs LSP — use BOTH on the same symbol when
+                       in doubt. LSP for the precise definition site
+                       and semantic references; REFS to catch text-only
+                       callers LSP missed (templates, getattr, string
+                       references). They complement, not replace.
+
+  ── Pre-built indices (built once at Phase 1, per run) ────────────
+  [PURPOSE: category]  Expand a code category from the Phase-1 purpose
+                       map. At the start of each run an AI scans the
+                       whole project and groups code into purpose
+                       categories (e.g. "WebSocket message handlers",
+                       "API error responses"). This returns every
+                       file/line range in that category with ±10 lines
+                       of context. Use when investigating BY INTENT, not
+                       by symbol name.
+
+  [SEMANTIC: query]    Fuzzy match over the purpose categories. Takes a
+                       natural-language description and returns the top
+                       10 matching categories with their code. Use when
+                       you'd reach for PURPOSE but don't know the exact
+                       category name.
+
+  [DETAIL: section]    Pre-built code map for a feature area or
+                       subsystem (coarser than purpose categories).
+
+  ── Direct file access ────────────────────────────────────────────
   [CODE: path]         Read the FULL file — NEVER add line numbers here
-  [KEEP: path N-M]     After [CODE:], strip to the lines you need
-  [SEARCH: pattern]    Ripgrep text search across files
-  [DETAIL: section]    Code map for a feature area
-  [WEBSEARCH: query]   External API docs
+                       ([CODE: path N-M] is REJECTED). Large files
+                       return a SKELETON only; follow up with [VIEW:].
+  [VIEW: path LINE]    Read ~200 lines around LINE in a large file.
+                       Auto-extends to the enclosing def/class.
+  [VIEW: path N-M]     Explicit range, max 600 lines.
+  [KEEP: path N-M]     After [CODE:], narrow to the lines you need
+                       (preserves line numbers for [REPLACE LINES …]).
+
+  ── Text + external ──────────────────────────────────────────────
+  [SEARCH: pattern]    Ripgrep regex/text search across the codebase.
+                       Use for non-symbol patterns (error message
+                       strings, magic constants, boilerplate scaffolds).
+  [WEBSEARCH: query]   External API / library documentation.
+  [KNOWLEDGE: topic]   Internal knowledge base lookup.
+  [DISCARD: #label]    Drop a labeled result from context.
 
   ⚠ [CODE: path N-M] is FORBIDDEN. Line numbers in [CODE:] are not
     supported. Always read the full file, then use [KEEP: path N-M]
@@ -243,6 +326,28 @@ For each relevant function:
 """
 
 PLAN_COT_EXISTING = """══════════════════════════════════════════════════════════════════════
+⚠ HARD RULE — NO CODE IN THE PLAN. NONE. EVER. ⚠
+══════════════════════════════════════════════════════════════════════
+The plan you emit MUST contain zero code. Not ```python``` / ```js```
+fences. Not `def foo(): ...` snippets. Not before/after Python
+fragments. Not multi-line REPLACE bodies for the coder to paste.
+
+The plan body is PROSE: names, locations, branch behavior in English.
+The coder reads the file directly and writes the actual code. Your
+job is the DESIGN DECISION, the EXACT LOCATION, and the PRECISE
+DESCRIPTION — never the code itself.
+
+WHY THIS MATTERS (observed failure mode — sympy-14248):
+  The plan embedded before/after Python snippets. The coder MIRRORED
+  that format — it wrote markdown code fences instead of `=== EDIT ===`
+  blocks. Runtime extracted 0 edits. 5 attempts × 0 edits = 0-byte
+  patch. The instance failed because the planner gave the coder a
+  format to copy. Don't be that planner.
+
+If you catch yourself typing ` ``` ` on its own line → STOP. The
+coder mirrors your format. Describe the change in English instead.
+
+══════════════════════════════════════════════════════════════════════
 ADDITIONAL SYSTEM FRAMING (continued) — PLANNER-SPECIFIC RULES
 ══════════════════════════════════════════════════════════════════════
 The universal identity, tool protocol, signal protocol, and thinking
@@ -1124,6 +1229,59 @@ STEP RULES:
     plain-English description of every change. A step that references
     "the function from step 1" or omits FILES: is not self-contained.
 
+  WHAT A WELL-SHAPED PLAN LOOKS LIKE — the IMPLEMENT loop reads one
+  STEP at a time. The coder for STEP N only sees the files listed on
+  that step's `FILES:` line; everything else is invisible to them.
+  A plan that's RIGHT in the prose but doesn't crystallize each change
+  into a STEP block won't get implemented.
+
+  The shape that gets implemented correctly:
+
+      ## REQUIREMENTS
+      R1. IndexVariable.to_index_variable() must return a NEW object,
+          not self. UNMET — fixed by STEP 1.
+      R2. Dataset.swap_dims() must defend against the legacy `return
+          self` path during the migration. UNMET — fixed by STEP 2.
+
+      ## IMPLEMENTATION STEPS
+
+      ### STEP 1: Make IndexVariable.to_index_variable() return a copy
+      SATISFIES: R1
+      DEPENDS ON: (none)
+      FILES: xarray/core/variable.py (modify)
+      WHAT TO DO:
+        variable.py:
+          - ACTION 1 (IndexVariable.to_index_variable at line 2882-2884):
+            the method currently returns `self`. Change it to return
+            `self.copy(deep=False)` so callers always get a distinct
+            object whose `.dims` can be mutated without aliasing.
+            REASON: satisfies R1 — direct fix of the documented bug.
+
+      ### STEP 2: Defensive guard in Dataset.swap_dims()
+      SATISFIES: R2
+      DEPENDS ON: STEP 1   (R1 must land first)
+      FILES: xarray/core/dataset.py (modify)
+      WHAT TO DO:
+        dataset.py:
+          - ACTION 1 (Dataset.swap_dims body around line 3775):
+            after `var = v.to_index_variable()`, add an identity check
+            `if var is v: var = var.copy(deep=False)`. With STEP 1 in
+            place this is a no-op; without it (or for callers on older
+            code paths) it prevents mutation.
+            REASON: satisfies R2 — belt-and-braces for the migration.
+
+  Notice each STEP has its OWN `FILES:` line covering exactly the files
+  IT touches. If your plan needs to modify N files, prefer N STEP
+  blocks — one per file — unless two files share a single tightly-
+  coupled change. The coder gets the right context for each edit and
+  nothing gets lost in prose.
+
+  Two STEPS for two files is also how DEPENDS ON earns its keep:
+  STEP 2 above explicitly waits on STEP 1 because R2's value depends
+  on R1 already landing. If you bundle both files into one STEP, the
+  coder may apply them in either order and you lose that ordering
+  guarantee.
+
 COMPLETENESS CHECKLIST — before writing EDGE CASES:
   □ Every requirement from the task spec maps to a numbered step
   □ Every new data element (token, field, param) has been DATA FLOW
@@ -1204,6 +1362,24 @@ believe in.
 """
 
 PLAN_COT_NEW = """══════════════════════════════════════════════════════════════════════
+⚠ HARD RULE — NO CODE IN THE PLAN. NONE. EVER. ⚠
+══════════════════════════════════════════════════════════════════════
+The plan you emit MUST contain zero code. Not ```python``` / ```js```
+fences. Not `def foo(): ...` snippets. Not full function bodies for
+the coder to paste. Even for a new project, the plan is the DESIGN —
+exact signatures, branch behavior, file structure in PROSE — not the
+implementation.
+
+The coder reads the plan and writes the actual code. If you embed
+code, the coder copies it verbatim (bugs and all) or — worse —
+mirrors the format and writes markdown fences instead of the
+required `=== EDIT ===` blocks, producing zero applied edits.
+
+If you catch yourself typing ` ``` ` on its own line → STOP. Describe
+the change in English: name the function, its inputs/outputs, each
+branch's behavior, exceptions it raises.
+
+══════════════════════════════════════════════════════════════════════
 ADDITIONAL SYSTEM FRAMING (continued) — PLANNER-SPECIFIC RULES (NEW PROJECT)
 ══════════════════════════════════════════════════════════════════════
 The universal identity, tool protocol, signal protocol, and thinking
@@ -1423,8 +1599,25 @@ The [STOP]+[CONFIRM_STOP] pair is the runtime signal — [STOP] alone is
 inert text (so you can safely discuss the tag in prose).
 Add #label to name results. [DISCARD: #label] to remove irrelevant ones.
 
-  [REFS: name]       All definitions, imports, call sites
-  [LSP: name]        Type info, inheritance
+  [REFS: name]       Ripgrep word-boundary search. Returns DEFINED +
+                     IMPORTED + USED buckets. Definitions never
+                     truncated; USED capped at 30. Catches string
+                     literals + comments LSP cannot see.
+  [LSP: name]        Semantic symbol resolution via a language server.
+                     Returns canonical definition + every reference +
+                     type info / hover. NO truncation. Knows method
+                     overrides, re-exports, inheritance. Falls back to
+                     REFS if no LSP server is installed.
+                     (REFS and LSP are complementary — use both when
+                     in doubt: LSP for the definitive site, REFS to
+                     catch text-only callers.)
+  [PURPOSE: category] Expand a category from the Phase-1 purpose map
+                     (the AI-built code categorization scan). Returns
+                     every file/line range in that category with ±10
+                     lines context. Use when investigating BY INTENT.
+  [SEMANTIC: query]  Fuzzy match over the purpose categories. Top-10
+                     matches. Use when you want PURPOSE but don't know
+                     the exact category name.
   [CODE: path]       Read the FULL file — NEVER add line numbers here.
                      [CODE: path N-M] is FORBIDDEN. Read full, then KEEP/VIEW.
                      On files too large to fit, [CODE:] returns a SKELETON
@@ -1433,22 +1626,25 @@ Add #label to name results. [DISCARD: #label] to remove irrelevant ones.
   [VIEW: path LINE]  Read ~200 lines centered on LINE in a LARGE file (one
                      that [CODE:] returned as SKELETON). Auto-extends to
                      the enclosing def/class so you always see a complete
-                     unit. Use this for EXPLORATION — when you have a line
-                     number from the skeleton but don't yet know the file.
-                     REJECTED on small files (use [CODE:] there instead).
+                     unit. REJECTED on small files (use [CODE:] there).
   [VIEW: path N-M]   Same, but explicit range. Max 600 lines per call.
-  [KEEP: path N-M]   After [CODE:], strip to the lines you need (for
-                     surgical edits — line numbers preserve so [REPLACE
-                     LINES N-M] anchors correctly).
-  [SEARCH: pattern]   Ripgrep text search (⚠ not edit syntax)
-  [SEMANTIC: description] Vector embedding search — describe what you want in plain English,
-                      returns the 10 most relevant purpose categories' code with ±10 line context
-  [DETAIL: section]   Code map for feature area
-  [PURPOSE: category] All code serving an exact/fuzzy purpose category name
-  [WEBSEARCH: query]  External docs
+  [KEEP: path N-M]   After [CODE:], strip to the lines you need (line
+                     numbers preserve so [REPLACE LINES N-M] anchors
+                     correctly).
+  [SEARCH: pattern]  Ripgrep regex/text search (⚠ not edit syntax).
+                     Use for non-symbol patterns.
+  [DETAIL: section]  Code map for feature area / subsystem.
+  [WEBSEARCH: query] External docs.
 
-  REFS first → SEMANTIC if you don't know the exact name → CODE for details.
-  On a BIG file: [CODE:] returns a skeleton → pick a line → [VIEW: path lineN].
+  PICK BY INTENT:
+    • Named method/class — where is it defined?     → [LSP: name]
+    • Want every text occurrence of an identifier?  → [REFS: name]
+    • Looking for code by intent ("error msgs")?    → [PURPOSE: …]
+    • Don't know the category name?                 → [SEMANTIC: query]
+    • Need to see a specific file?                  → [CODE: path]
+    • Large file — only certain lines?              → [CODE:] then [VIEW:] or [KEEP:]
+    • Specific text pattern (not a symbol)?         → [SEARCH: pattern]
+    • External library docs?                        → [WEBSEARCH: query]
   Every claim about code must cite a line number from a tool result.
 
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -1483,6 +1679,46 @@ PROJECT OVERVIEW:
 """
 
 IMPLEMENT_PROMPT = """══════════════════════════════════════════════════════════════════════
+⚠ HARD RULE — EVERY CHANGE MUST BE IN === EDIT === BLOCKS ⚠
+══════════════════════════════════════════════════════════════════════
+The runtime ONLY extracts changes from this exact envelope:
+
+  === EDIT: path/to/file.py ===
+  [SEARCH]
+  ...old text exactly as it appears in the file...
+  [/SEARCH]
+  [REPLACE]
+  ...new text...
+  [/REPLACE]
+
+Or the line-based variant:
+
+  === EDIT: path/to/file.py ===
+  [REPLACE LINES start-end]
+  ...new text...
+  [/REPLACE]
+
+ANYTHING OUTSIDE THAT ENVELOPE IS PROSE. It is NOT applied to the file.
+
+That means:
+  ✗ ```python … ``` markdown fences — DO NOT produce edits.
+  ✗ "Here is the new function: def foo(...)" — DOES NOT produce edits.
+  ✗ Bare diffs / pseudo-diffs — DO NOT produce edits.
+  ✗ Even if the PLAN contains code in markdown fences, YOUR response
+    must wrap each change in `=== EDIT: ===` blocks. Do NOT mirror the
+    plan's format.
+
+If you find yourself typing ` ``` ` on its own line outside of a
+`[think]` block → STOP. Rewrite as `=== EDIT: path === [SEARCH]…
+[/SEARCH] [REPLACE]…[/REPLACE]` immediately.
+
+WHY THIS MATTERS (observed failure — sympy-14248): coder narrated
+the patch in markdown fences instead of EDIT blocks. Runtime
+extracted 0 edits. 5 retries × 0 edits = 0-byte patch. The instance
+failed not because the model didn't know the fix, but because the
+fix was in the wrong format.
+
+══════════════════════════════════════════════════════════════════════
 [SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
 ══════════════════════════════════════════════════════════════════════
 This block (until [USER REQUEST]) is JARVIS describing HOW you fit into
@@ -1692,6 +1928,46 @@ When to use BARE vs FENCED:
 The pattern overall: act → reflect (in [think]) → act → reflect →
 lookup only when reflection turns up a CONCRETE question that the
 file_content already in your context cannot answer.
+
+══════════════════════════════════════════════════════════════════════
+TWO WAYS TO END A STEP — [DONE] vs [FORCE DONE]
+══════════════════════════════════════════════════════════════════════
+
+A step ends with ONE of two two-tag signals, depending on whether you
+emitted any `=== EDIT === ` blocks:
+
+  [DONE][CONFIRM_DONE]
+    Use AFTER you have emitted at least one `=== EDIT === ` block whose
+    SEARCH/REPLACE pair produces a real change. Plain [DONE] with NO
+    edit blocks NOW TRIGGERS A RETRY — the runtime assumes you forgot
+    to emit edits and gives you another attempt. Do not end a step
+    with [DONE] if you produced zero edits.
+
+  [FORCE DONE][CONFIRM_FORCE_DONE]
+    The "no edits required" escape hatch. Use when you read the file,
+    verified the step requirement is ALREADY MET, and zero edits are
+    needed. The runtime accepts this as a clean step completion
+    without retrying. Examples:
+      • An earlier step (or a parallel coder) already applied the
+        change. You re-read the file and the target lines now contain
+        exactly what the plan asked for. → [FORCE DONE].
+      • The plan asked for a defensive check that the existing code
+        already does correctly. No change required. → [FORCE DONE].
+
+    Don't abuse this — only use [FORCE DONE] when you have READ the
+    file (via [CODE:] / [VIEW:]) and can name the line(s) that
+    already satisfy the requirement. "I think it's probably fine" is
+    a lookup, not a [FORCE DONE].
+
+When fix #17 catches a no-op REPLACE (SEARCH matched but REPLACE body
+identical to the matched range) on attempt N, it retries with feedback
+that the file is unchanged. On attempt N+1:
+  • If the file already satisfies the requirement → [FORCE DONE].
+  • If your earlier SEARCH was wrong and you meant a different
+    location → write a new `=== EDIT === ` with the correct anchor.
+
+NEVER end with `[DONE]` after a "no real diff produced" retry — that
+just burns another attempt. Either fix the edit or [FORCE DONE].
 
 ══════════════════════════════════════════════════════════════════════
 REVISE EDIT — retract and rewrite a pending edit you just wrote
@@ -1974,8 +2250,19 @@ The tool list below is the coder's available palette:
   [VIEW: path N-M #label]   Same but explicit range. Max 600 lines.
   [KEEP: path N-M #label]   AFTER [CODE:] on a small/medium file, strip to
                             the kept ranges for surgical edits.
-  [REFS: name #label]       Find all definitions, imports, call sites
-  [SEARCH: pattern #label]  Ripgrep text search (⚠ not edit syntax)
+  [REFS: name #label]       Ripgrep word-boundary symbol search. DEFINED +
+                            IMPORTED + USED buckets. Definitions never
+                            truncated; USED capped at 30.
+  [LSP: name #label]        Semantic symbol resolution (language server).
+                            Canonical definition + every reference + type
+                            info. NO truncation. Use for precise "where is
+                            this defined / what connects to it" on a
+                            specific method/class. Complements REFS.
+  [PURPOSE: cat #label]     Expand a category from the Phase-1 purpose map
+                            (AI-built code categorization). Use for code
+                            BY INTENT, not by symbol name.
+  [SEMANTIC: query #label]  Fuzzy match over purpose categories — top 10.
+  [SEARCH: pattern #label]  Ripgrep regex/text search (⚠ not edit syntax)
   [DISCARD: #label]         Remove a result from context
 
 ⚠⚠⚠  THE HALLUCINATION TRAP — the most common silent coder failure  ⚠⚠⚠
@@ -2621,12 +2908,20 @@ ALWAYS use the [tool use] wrapper, even for a single tag. Bare tags like
 system mis-parsing your prose as tool calls. WRAP THEM.
 
 Prefer CHEAP tools over EXPENSIVE ones:
-  Cheap & narrow:  [REFS: name]  [LSP: name]  [SEARCH: pattern]  [DETAIL: x]
+  Cheap & narrow:  [REFS: name]  [LSP: name]  [PURPOSE: cat]
+                   [SEMANTIC: q]  [SEARCH: pattern]  [DETAIL: x]
   Moderate:        [KEEP: path N-M]  (only after the file is already loaded)
-  EXPENSIVE:       [CODE: path]     (whole file — slow on large files)
+                   [VIEW: path L]    (slice of a large file)
+  EXPENSIVE:       [CODE: path]      (whole file — slow on large files)
 
-  [REFS: name]       [CODE: path]       [KEEP: path N-M]
-  [SEARCH: pattern]  [DETAIL: section]  [DISCARD: #label]
+Pick by intent:
+  • Named function/class/method — where defined?    → [LSP: name]
+  • Every text match of an identifier?              → [REFS: name]
+  • Code by intent (e.g. "error msgs")?             → [PURPOSE: cat]
+  • Don't know the exact category name?             → [SEMANTIC: q]
+  • Specific text/regex pattern?                    → [SEARCH: pattern]
+  • Subsystem map?                                  → [DETAIL: section]
+  • Need to read a specific file?                   → [CODE: path]
 
 ══════════════════════════════════════════════════════════════════════
 PART 1 — PICK THE BEST PLAN
@@ -2721,6 +3016,23 @@ your improved version using === PLAN === / === PLAN_EDIT === tools.
 """
 
 MERGE_PROMPT_TEMPLATE = """══════════════════════════════════════════════════════════════════════
+⚠ HARD RULE — THE FINAL PLAN MUST CONTAIN ZERO CODE ⚠
+══════════════════════════════════════════════════════════════════════
+The merged plan you emit MUST contain zero code. If any of the input
+plans contain ```python``` blocks, `def foo(): ...` snippets, or
+multi-line REPLACE bodies, STRIP THEM OUT when integrating. Convert
+each code-laden step into a PROSE description: what the new function
+does (inputs, branches, outputs, exceptions) — not the function body.
+
+WHY THIS MATTERS (observed failure mode — sympy-14248):
+  Final plan contained code. Coder mirrored the format, wrote
+  markdown fences instead of `=== EDIT ===` blocks, runtime extracted
+  zero edits, 5 IMPLEMENT attempts all failed → 0-byte patch.
+
+You are the LAST checkpoint before code. If code leaks through here,
+the coder ships nothing.
+
+══════════════════════════════════════════════════════════════════════
 [SYSTEM] — your role in the JARVIS pipeline (workflow, not user request)
 ══════════════════════════════════════════════════════════════════════
 This block (until [USER REQUEST]) is JARVIS describing HOW you fit into
@@ -3096,23 +3408,43 @@ After the system runs your tools, you write the plan. NOT more tools.
 
 Available tools:
   [CODE: path]          read the FULL file — NEVER add line numbers.
-                        [CODE: path N-M] is FORBIDDEN and returns nothing.
-  [KEEP: path N-M]      AFTER [CODE:] — strips the file to just the lines
-                        you need; everything else leaves your context.
-                        ⚠ Plan to KEEP narrowly the FIRST time — re-KEEPing
-                        the same ranges is a LOOP and will be flagged.
-  [REFS: name]          find all definitions, imports, usages of a symbol.
-                        Prefer REFS over CODE — it's faster, narrower, and
-                        cached across all 4 planners' previous work.
-  [SEARCH: pattern]     ripgrep text search across the project
-  [DETAIL: section]     look up a section of the code map
+                        [CODE: path N-M] is FORBIDDEN. On large files
+                        returns a SKELETON only; follow up with [VIEW:].
+  [VIEW: path L]        ~200 lines around L in a large file. Auto-
+                        extends to enclosing def/class.
+  [VIEW: path N-M]      Explicit range, max 600 lines.
+  [KEEP: path N-M]      AFTER [CODE:] — strips the file to just those
+                        lines; everything else leaves your context.
+                        Re-KEEPing the same ranges is a LOOP.
+  [REFS: name]          ripgrep word-boundary symbol search. Returns
+                        DEFINED + IMPORTED + USED buckets. Definitions
+                        always preserved (priority pass); USED capped
+                        at 30. Cached across the 4 planners' previous
+                        work.
+  [LSP: name]           semantic symbol resolution via language server.
+                        Canonical definition + every reference + type
+                        info. NO truncation. Use for precise "where is
+                        this defined / what connects to it" on a named
+                        method/class. Complements REFS (LSP misses
+                        text-only callers; REFS misses overrides &
+                        re-exports). Falls back to REFS if no LSP
+                        server installed.
+  [PURPOSE: category]   expand a category from the Phase-1 purpose map
+                        (AI-built code categorization). Every file/line
+                        range in that category with ±10 lines context.
+                        Use when investigating BY INTENT.
+  [SEMANTIC: query]     fuzzy match over purpose categories — top 10.
+                        Use when PURPOSE category name is unclear.
+  [SEARCH: pattern]     ripgrep regex/text search (non-symbol patterns).
+  [DETAIL: section]     pre-built code map for a feature subsystem.
 
 CHEAP vs EXPENSIVE — pick the cheapest tool that answers the question:
-  REFS / LSP / DETAIL / SEARCH — cheap, cached, narrow.
+  REFS / LSP / PURPOSE / SEMANTIC / DETAIL / SEARCH — cheap, cached,
+    narrow. ALWAYS try one of these first.
   KEEP — moderate, but only if you already have the file loaded.
-  CODE — EXPENSIVE on a large file (5000+ lines). Use REFS or SEARCH
-         first; only fall back to CODE when you genuinely need a region
-         REFS can't reach.
+  CODE — EXPENSIVE on a large file (5000+ lines). Use REFS / LSP /
+    SEARCH first; only fall back to CODE when you genuinely need a
+    region they can't reach.
 
 MANDATORY WORKFLOW FOR LARGE FILES:
   Step 1 — read the full file:
@@ -3192,6 +3524,38 @@ STEP 4 — OUTPUT THE FINAL PLAN
 ## EDGE CASES
 ## VERIFICATION (delivery path trace — origin to render)
 ## TEST CRITERIA
+
+A well-shaped IMPLEMENTATION STEPS section: one STEP per file you
+intend to modify (unless two files share a single tightly-coupled
+change). Each STEP carries its own `FILES:` line covering the files
+that STEP touches. The coder runs ONE step at a time and only sees
+the files on that step's FILES: line, so a change mentioned only in
+prose — even in REQUIREMENTS — won't reach them.
+
+The shape that gets implemented correctly looks like:
+
+    ### STEP 1: Fix the root method
+    SATISFIES: R1
+    FILES: pkg/core/variable.py (modify)
+    WHAT TO DO:
+      variable.py:
+        - ACTION 1 (Class.method at line N): change `return self` to
+          `return self.copy(deep=False)`.
+          REASON: satisfies R1 directly.
+
+    ### STEP 2: Defensive guard at the call site
+    SATISFIES: R2
+    DEPENDS ON: STEP 1
+    FILES: pkg/core/dataset.py (modify)
+    WHAT TO DO:
+      dataset.py:
+        - ACTION 1 (function caller around line M): after the
+          `to_index_variable()` call, add an `if var is v:` guard.
+          REASON: belt-and-braces for callers on older code paths.
+
+Two files → two STEPs, each owning one file. DEPENDS ON wires the
+ordering when one fix has to land before the other. The coder gets
+the right context per step and nothing is lost to prose.
 
 ## PRE-MORTEM RESOLUTION
 Revisit each pre-mortem risk from your DEEP THINK section D. For each:
@@ -3404,8 +3768,16 @@ TOOLS
                             Use after [CODE:] returns a skeleton.
   [VIEW: path N-M #label]   Same, explicit range. Max 600 lines.
   [KEEP: path N-M #label]   Strip to kept ranges (small/medium files)
-  [REFS: name #label]       Definitions, imports, call sites
-  [SEARCH: pattern #label]  Ripgrep text search (⚠ NOT edit syntax)
+  [REFS: name #label]       Ripgrep word-boundary symbol search.
+                            DEFINED + IMPORTED + USED; defs never
+                            truncated; USED capped at 30.
+  [LSP: name #label]        Semantic symbol resolution (language server).
+                            Canonical definition + every reference + type
+                            info. NO truncation. Complements REFS for
+                            "where is this defined / what connects to it".
+  [PURPOSE: cat #label]     Expand a category from the Phase-1 purpose map.
+  [SEMANTIC: query #label]  Fuzzy match over purpose categories — top 10.
+  [SEARCH: pattern #label]  Ripgrep regex/text search (⚠ NOT edit syntax)
 
 THE TWO-TAG SIGNAL PROTOCOL — write tags inside [tool use]...[/tool use],
 then fire the signal on adjacent lines:
@@ -4225,6 +4597,166 @@ _SECTION_BOUNDARY_RE = re.compile(
     r'===\s*(?:EDIT|FILE|REVISE\s+EDIT):|===\s*END\s+FILE\s*===',
     re.IGNORECASE,
 )
+
+
+def _check_deleted_imports(
+    rel_path: str, original: str, modified: str, project_root,
+) -> list[tuple[str, str]]:
+    """Detect when a coder edit removes a top-level import that other files
+    re-export from this module.
+
+    Observed failure on astropy__astropy-13236: the coder removed
+    `from .ndarray_mixin import NdarrayMixin` from `astropy/table/table.py`
+    because it looked unused inside the file. But `astropy/table/__init__.py`
+    does `from .table import (..., NdarrayMixin, ...)` — so the deletion
+    nuked a PUBLIC re-export → ImportError at module load → 644 tests
+    failed at collection.
+
+    Returns a list of `(deleted_import_line, evidence)` tuples for each
+    deletion that has at least one external consumer. Empty list means
+    the edit is safe to apply.
+
+    Only checks `.py` files. The grep is bounded to ~10 candidate files
+    per removed name and uses subprocess `grep -rln` for speed; the actual
+    name-binding check is done in Python after the grep narrows the set.
+    """
+    if not rel_path.endswith(".py"):
+        return []
+
+    def _top_level_imports(text: str) -> set[str]:
+        out = set()
+        for line in text.splitlines():
+            if not line or line[0] in (" ", "\t"):
+                continue
+            stripped = line.rstrip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                out.add(stripped)
+        return out
+
+    removed = _top_level_imports(original) - _top_level_imports(modified)
+    if not removed:
+        return []
+
+    if rel_path.endswith("/__init__.py"):
+        module_path = rel_path[: -len("/__init__.py")].replace("/", ".")
+        basename = rel_path.rsplit("/", 2)[-2] if "/" in rel_path else ""
+    else:
+        module_path = rel_path[:-3].replace("/", ".")
+        basename = rel_path[:-3].rsplit("/", 1)[-1]
+    if not module_path:
+        return []
+
+    project_root_path = Path(project_root)
+    own_dir = (project_root_path / rel_path).parent
+    findings: list[tuple[str, str]] = []
+    cached_grep: dict[str, list[str]] = {}
+
+    def _do_grep(needle: str, scope_dir: Path | None = None) -> list[str]:
+        """Cache + run grep. scope_dir limits search; None = whole project."""
+        scope = str(scope_dir) if scope_dir else str(project_root_path)
+        key = f"{scope}::{needle}"
+        if key not in cached_grep:
+            try:
+                cp = subprocess.run(
+                    ["grep", "-rln", "--include=*.py",
+                     "--exclude-dir=.jarvis_sandbox",
+                     "--exclude-dir=.git",
+                     "--exclude-dir=__pycache__",
+                     "--exclude-dir=.tox",
+                     needle, scope],
+                    capture_output=True, text=True, timeout=20,
+                )
+                cached_grep[key] = [
+                    f for f in cp.stdout.splitlines()
+                    if f and not f.endswith("/" + rel_path)
+                    and not f.endswith(rel_path)
+                ]
+            except Exception:
+                cached_grep[key] = []
+        return cached_grep[key]
+
+    for imp_line in removed:
+        names: list[str] = []
+        m_from = re.match(r"^from\s+\S+\s+import\s+(.+)$", imp_line)
+        m_imp = re.match(r"^import\s+(\S+)", imp_line)
+        if m_from:
+            raw = m_from.group(1).strip().rstrip(")").strip("()")
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if " as " in part:
+                    names.append(part.split(" as ")[-1].strip())
+                else:
+                    names.append(part)
+        elif m_imp:
+            full = m_imp.group(1).strip()
+            names.append(full.split(".")[0])
+
+        for name in names:
+            if not name or not re.match(r"^[A-Za-z_]\w*$", name):
+                continue
+
+            # Two consumer forms to look for:
+            #   1. absolute  →  `from astropy.table.table import NdarrayMixin`
+            #   2. relative  →  `from .table import NdarrayMixin`  (sibling)
+            #                   `from ..table import …`            (parent-dir)
+            # The relative forms only appear inside the same package, so we
+            # check them with a directory-scoped grep against `from .basename`.
+            candidate_files = list(_do_grep(f"from {module_path} import"))
+            if basename:
+                candidate_files += _do_grep(f"from .{basename} import", own_dir)
+                if own_dir.parent != project_root_path:
+                    candidate_files += _do_grep(
+                        f"from ..{basename} import", own_dir.parent
+                    )
+            # De-dup while preserving order
+            seen: set[str] = set()
+            uniq: list[str] = []
+            for f in candidate_files:
+                if f not in seen:
+                    seen.add(f)
+                    uniq.append(f)
+            candidate_files = uniq[:15]
+
+            real_consumers: list[str] = []
+            patterns = [
+                re.compile(
+                    rf"from\s+{re.escape(module_path)}\s+import\s+([^\n;]+)"
+                ),
+            ]
+            if basename:
+                patterns.append(re.compile(
+                    rf"from\s+\.+{re.escape(basename)}\s+import\s+([^\n;]+)"
+                ))
+
+            for cf in candidate_files:
+                try:
+                    txt = Path(cf).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                for pat in patterns:
+                    matched = False
+                    for m in pat.finditer(txt):
+                        imported = m.group(1)
+                        if re.search(rf"\b{re.escape(name)}\b", imported):
+                            line_num = txt[: m.start()].count("\n") + 1
+                            try:
+                                rel_consumer = str(Path(cf).relative_to(project_root_path))
+                            except ValueError:
+                                rel_consumer = cf
+                            real_consumers.append(f"{rel_consumer}:{line_num}")
+                            matched = True
+                            break
+                    if matched:
+                        break
+
+            if real_consumers:
+                findings.append(
+                    (imp_line, f"`{name}` re-exported via {', '.join(real_consumers[:3])}")
+                )
+
+    return findings
 
 
 def _apply_revise_edits(response: str) -> str:
@@ -5961,8 +6493,15 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
         if not is_new_project:
             verify_block = (
                 "Verify claims against real code:\n"
-                "  [REFS: name] / [LSP: name] / [DETAIL: feature] / [CODE: path]\n"
-                "  [REFS: name] — find all definitions, imports, usages\n"
+                "  [LSP: name]     semantic resolution — canonical def +\n"
+                "                  every reference (no cap). USE THIS for\n"
+                "                  named methods/classes — knows overrides.\n"
+                "  [REFS: name]    ripgrep word-boundary — DEFINED/IMPORTED/\n"
+                "                  USED buckets, defs always preserved.\n"
+                "  [PURPOSE: cat]  expand a Phase-1 purpose category.\n"
+                "  [SEMANTIC: q]   fuzzy match over purpose categories.\n"
+                "  [CODE: path]    read the file (skeleton for large files,\n"
+                "                  then [VIEW: path L] to drill in).\n"
             )
 
         merge_prompt = SYSTEM_KNOWLEDGE + MERGE_PROMPT_TEMPLATE.format(
@@ -5993,8 +6532,15 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
         if not is_new_project:
             verify_block = (
                 "Verify claims against real code:\n"
-                "  [REFS: name] / [LSP: name] / [DETAIL: feature] / [CODE: path]\n"
-                "  [REFS: name] — find all definitions, imports, usages\n"
+                "  [LSP: name]     semantic resolution — canonical def +\n"
+                "                  every reference (no cap). USE THIS for\n"
+                "                  named methods/classes — knows overrides.\n"
+                "  [REFS: name]    ripgrep word-boundary — DEFINED/IMPORTED/\n"
+                "                  USED buckets, defs always preserved.\n"
+                "  [PURPOSE: cat]  expand a Phase-1 purpose category.\n"
+                "  [SEMANTIC: q]   fuzzy match over purpose categories.\n"
+                "  [CODE: path]    read the file (skeleton for large files,\n"
+                "                  then [VIEW: path L] to drill in).\n"
                 "Write tags, wait, then proceed.\n"
             )
 
@@ -6028,6 +6574,7 @@ async def phase_plan(task: str, context: str, complexity: int, project_root: str
     # `[CONFIRM_DONE]` produced after the model already stopped) can still
     # ride through. Drop both halves so plan content is signal-free.
     for _pat in (r'\[DONE\]', r'\[CONFIRM_DONE\]',
+                 r'\[FORCE\s+DONE\]', r'\[CONFIRM_FORCE_DONE\]',
                  r'\[STOP\]', r'\[CONFIRM_STOP\]',
                  r'\[CONTINUE\]', r'\[CONFIRM_CONTINUE\]'):
         best_plan = re.sub(_pat, '', best_plan, flags=re.IGNORECASE)
@@ -7354,6 +7901,23 @@ async def _implement_one_step(
             # returning, so NEVER search for "[done]" in answer_lower — it will
             # never be there. Use the explicit flag instead.
             done_signaled = impl_result.get("done", False)
+            force_done_signaled = impl_result.get("force_done", False)
+
+            # FORCE_DONE is the coder's explicit escape hatch: "the step
+            # requirement is already met in the file, no edits needed." This
+            # is the preferred way to signal a no-op step — plain [DONE]
+            # without edits triggers a retry below (the coder might just
+            # have forgotten to emit edits). Observed need on django-15916:
+            # after fix #17 caught a no-op REPLACE, the coder wrote [DONE]
+            # with no edits, which the retry logic then bounced as "No code
+            # produced", burning attempts. [FORCE DONE] makes the intent
+            # explicit and accepts the step cleanly.
+            if force_done_signaled:
+                status(
+                    f"    Step {step_num}: forced done by coder "
+                    f"(requirement already met — [FORCE DONE])"
+                )
+                break
 
             # Verify steps legitimately produce no code — if the step name or
             # details says verify/confirm/no changes, accept a [DONE] response
@@ -7390,8 +7954,15 @@ async def _implement_one_step(
             prev_attempt_thinking = attempt_thinking
             prev_attempt_summary = (
                 "OUTCOME: NO edits were produced. The model wrote a response but "
-                "no edit blocks were extractable. Use [SEARCH]/[REPLACE] or "
-                "[REPLACE LINES N-M] format wrapped in === EDIT: path === markers."
+                "no edit blocks were extractable.\n"
+                "• If you intended to EDIT the file: wrap every change in "
+                "`=== EDIT: path === [SEARCH]…[/SEARCH] [REPLACE]…[/REPLACE]` "
+                "blocks. Plain [DONE] without any edit blocks now triggers a "
+                "retry — markdown code fences are not edits.\n"
+                "• If the step requirement is ALREADY MET in the file and no "
+                "edits are needed: end the round with "
+                "`[FORCE DONE][CONFIRM_FORCE_DONE]` (not plain [DONE]). That "
+                "is the explicit escape hatch for 'no changes required'."
             )
             continue
 
@@ -7432,6 +8003,98 @@ async def _implement_one_step(
                 warn(f"    Proceeding with {matched}/{total} matched edits")
 
         status(f"    Edits applied: {matched}/{total} matched")
+
+        # ── No-op detection ────────────────────────────────────────────
+        # SEARCH/REPLACE blocks whose REPLACE body is byte-identical to
+        # the matched range count as "matched" above but produce no real
+        # diff. Treat all-no-op as a failed attempt and retry with a
+        # specific diagnostic. Observed failure on django-11551 and
+        # django-14631: workflow reported "Applied N changes" but final
+        # `git diff` was empty.
+        if total > 0 and produced:
+            real_diff_files = [
+                fp for fp, content in produced.items()
+                if content != file_contents.get(fp, "")
+            ]
+            if not real_diff_files:
+                warn(
+                    f"    All {len(produced)} edit(s) SEARCH-matched but "
+                    f"REPLACE was identical to current file content (attempt {attempt})"
+                )
+                if attempt < MAX_RETRIES:
+                    attempt_thinking = impl_result.get("answer", "")
+                    if len(attempt_thinking) > 6000:
+                        attempt_thinking = (
+                            "(...earlier portion trimmed...)\n"
+                            + attempt_thinking[-6000:]
+                        )
+                    prev_attempt_thinking = attempt_thinking
+                    prev_attempt_summary = (
+                        f"OUTCOME: {len(produced)} edit(s) MATCHED but produced "
+                        f"NO REAL CHANGE — your [REPLACE] body was BYTE-IDENTICAL "
+                        f"to the matched range. The file is unchanged. View the "
+                        f"current file content and emit a genuinely different "
+                        f"[REPLACE] body that satisfies the step requirement. "
+                        f"If the requirement is already met, write "
+                        f"`STEP COMPLETE: NO CHANGES NEEDED` and stop — do not "
+                        f"emit empty edits."
+                    )
+                    status(f"    Retrying step {step_num} (no real diff produced)...")
+                    continue
+                else:
+                    warn(f"    Proceeding despite all-no-op edits (out of retries)")
+
+        # ── Deleted-import safety check ─────────────────────────────────
+        # If an edit removes a top-level `import`/`from … import …` line and
+        # some other file in the project re-exports those names via
+        # `from <this_module> import <name>`, the deletion will break the
+        # public re-export → ImportError → entire module unloadable.
+        # Observed failure on astropy__astropy-13236: 644 P→P tests failed
+        # because `NdarrayMixin` was removed from astropy/table/table.py
+        # but astropy/table/__init__.py re-exports it.
+        unsafe_deletions: dict[str, list[tuple[str, str]]] = {}
+        for fp, content in produced.items():
+            original_for_check = file_contents.get(fp, "")
+            if not original_for_check:
+                continue
+            findings = _check_deleted_imports(
+                fp, original_for_check, content, sandbox.project_root,
+            )
+            if findings:
+                unsafe_deletions[fp] = findings
+        if unsafe_deletions:
+            warn(
+                f"    Edit removes import(s) re-exported by other files "
+                f"(attempt {attempt}) — REJECTED to prevent ImportError"
+            )
+            if attempt < MAX_RETRIES:
+                lines: list[str] = []
+                for fp, findings in unsafe_deletions.items():
+                    for imp_line, evidence in findings[:3]:
+                        lines.append(f"  - In {fp}, removing `{imp_line}` would break {evidence}")
+                attempt_thinking = impl_result.get("answer", "")
+                if len(attempt_thinking) > 6000:
+                    attempt_thinking = (
+                        "(...earlier portion trimmed...)\n"
+                        + attempt_thinking[-6000:]
+                    )
+                prev_attempt_thinking = attempt_thinking
+                prev_attempt_summary = (
+                    "OUTCOME: your edit REMOVED a top-level import that is "
+                    "still consumed via `from <this_module> import <name>` in "
+                    "another file. The import looks unused INSIDE the file you "
+                    "edited, but it is a PUBLIC RE-EXPORT — deleting it breaks "
+                    "the package's import surface.\n"
+                    "Concrete consumers found:\n"
+                    + "\n".join(lines)
+                    + "\nRetry: KEEP the import line. If you genuinely need to "
+                    "remove a symbol, also update the re-exporting `__init__.py` "
+                    "and every consumer in the same step."
+                )
+                status(f"    Retrying step {step_num} (unsafe import deletion)...")
+                continue
+            else:
+                warn(f"    Proceeding despite unsafe import deletion (out of retries)")
 
         # Write to sandbox + update file_contents
         # First snapshot which files already had syntax errors BEFORE this
@@ -8502,16 +9165,63 @@ Apply these changes to {project_root}? (y/n)"""
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _extract_files_from_plan(plan: str, known_files: list[str]) -> list[str]:
-    """Extract file paths from the plan text (files to MODIFY)."""
-    files = set()
+    """Extract file paths from the plan text (files to MODIFY).
+
+    Filters out noise paths that should never reach the coder:
+      - Absolute system paths (start with `/`)
+      - Paths containing /.virtualenvs/, /site-packages/, /dist-packages/,
+        /testbed/, /opt/, /usr/, /tmp/ — these are runtime/traceback paths
+        that the plan-text regex happens to match.
+      - Paths containing `..` (relative traversal)
+      - "Bare basename" matches from prose (e.g. "matadd.py") UNLESS the
+        same basename appears verbatim in `known_files` (the project file
+        listing). The plan author meant the actual file, not a noise match.
+
+    Observed failure mode — sympy__sympy-17655: the plan body contained
+    a Python traceback whose frames mentioned
+    `/.virtualenvs/test/lib/python3.6/site-packages/sympy/geometry/point.py`.
+    The old regex captured that path as a "file to modify", and the coder
+    later wrote edits there → git diff of the actual sympy repo was empty.
+    """
+    candidates = set()
 
     for line in plan.split("\n"):
         matches = re.findall(r'[\w./\-]+\.(?:py|js|ts|html|css|json|lean|c|cpp|h|rs|java|go|rb|toml|yaml|yml|md)', line)
-        files.update(matches)
+        candidates.update(matches)
 
     for f in known_files:
         if f in plan:
-            files.add(f)
+            candidates.add(f)
+
+    NOISE_FRAGMENTS = (
+        "/.virtualenvs/", "/site-packages/", "/dist-packages/",
+        "/testbed/", "/opt/", "/usr/", "/tmp/", "/private/var/",
+    )
+    known_set = set(known_files)
+    known_basenames = {f.rsplit("/", 1)[-1]: f for f in known_files}
+
+    files = set()
+    for p in candidates:
+        # Drop absolute paths and runtime/traceback noise.
+        if p.startswith("/"):
+            continue
+        if ".." in p.split("/"):
+            continue
+        if any(frag in p for frag in NOISE_FRAGMENTS):
+            continue
+        # Exact match against known project files always wins.
+        if p in known_set:
+            files.add(p)
+            continue
+        # Bare basename (no `/` in path) — only keep if it maps unambiguously
+        # to a known project file. Multi-segment paths get the benefit of the
+        # doubt (planner may have cited a path not yet indexed).
+        if "/" not in p:
+            if p in known_basenames:
+                files.add(known_basenames[p])
+            # else: drop — prose mention like "matadd.py" without context
+            continue
+        files.add(p)
 
     return sorted(files)
 

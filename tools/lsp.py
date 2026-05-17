@@ -33,25 +33,97 @@ LSP_SERVERS = {
     "typescript": [
         {"cmd": ["typescript-language-server", "--stdio"], "name": "tsserver"},
     ],
+    "rust": [
+        {"cmd": ["rust-analyzer"], "name": "rust-analyzer"},
+    ],
+    "go": [
+        {"cmd": ["gopls"], "name": "gopls"},
+    ],
+    "c": [
+        {"cmd": ["clangd", "--background-index=false"], "name": "clangd"},
+    ],
+    "cpp": [
+        {"cmd": ["clangd", "--background-index=false"], "name": "clangd"},
+    ],
+    "java": [
+        {"cmd": ["jdtls"], "name": "jdtls"},
+    ],
+    "ruby": [
+        {"cmd": ["solargraph", "stdio"], "name": "solargraph"},
+    ],
+    "bash": [
+        {"cmd": ["bash-language-server", "start"], "name": "bash-ls"},
+    ],
+    "yaml": [
+        {"cmd": ["yaml-language-server", "--stdio"], "name": "yaml-ls"},
+    ],
+    "json": [
+        {"cmd": ["vscode-json-languageserver", "--stdio"], "name": "json-ls"},
+        {"cmd": ["vscode-json-language-server", "--stdio"], "name": "json-ls"},
+    ],
+    "html": [
+        {"cmd": ["vscode-html-language-server", "--stdio"], "name": "html-ls"},
+    ],
+    "css": [
+        {"cmd": ["vscode-css-language-server", "--stdio"], "name": "css-ls"},
+    ],
+    "lean": [
+        {"cmd": ["lean", "--server"], "name": "lean-ls"},
+    ],
+    "lua": [
+        {"cmd": ["lua-language-server"], "name": "lua-ls"},
+    ],
+    "haskell": [
+        {"cmd": ["haskell-language-server-wrapper", "--lsp"], "name": "hls"},
+    ],
+}
+
+
+# Language → file-extension set used to count files and pick the dominant
+# language for a project. Keep the same keys as LSP_SERVERS so the lookup
+# in _find_lsp_server stays consistent.
+LANGUAGE_EXTENSIONS = {
+    "python": {".py", ".pyi"},
+    "javascript": {".js", ".jsx", ".mjs", ".cjs"},
+    "typescript": {".ts", ".tsx"},
+    "rust": {".rs"},
+    "go": {".go"},
+    "c": {".c", ".h"},
+    "cpp": {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"},
+    "java": {".java"},
+    "ruby": {".rb"},
+    "bash": {".sh", ".bash"},
+    "yaml": {".yaml", ".yml"},
+    "json": {".json"},
+    "html": {".html", ".htm"},
+    "css": {".css", ".scss", ".sass"},
+    "lean": {".lean"},
+    "lua": {".lua"},
+    "haskell": {".hs"},
 }
 
 
 def _detect_language(project_root: str) -> str | None:
-    """Detect primary language by counting file extensions."""
-    counts = {"python": 0, "javascript": 0, "typescript": 0}
+    """Detect primary language by counting file extensions across the project.
+
+    Counts every recognised file extension and returns the language with
+    the highest count. If two languages tie, the iteration order of
+    LANGUAGE_EXTENSIONS wins (Python takes priority over JS, etc.).
+    """
+    counts = {lang: 0 for lang in LANGUAGE_EXTENSIONS}
     root = Path(project_root)
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in {
             "__pycache__", ".git", "node_modules", ".venv", "venv", "build", "dist",
+            ".jarvis_sandbox", "target", "vendor", ".tox", ".mypy_cache",
+            ".pytest_cache",
         }]
         for f in filenames:
-            ext = Path(f).suffix
-            if ext == ".py":
-                counts["python"] += 1
-            elif ext in (".js", ".jsx", ".mjs"):
-                counts["javascript"] += 1
-            elif ext in (".ts", ".tsx"):
-                counts["typescript"] += 1
+            ext = Path(f).suffix.lower()
+            for lang, exts in LANGUAGE_EXTENSIONS.items():
+                if ext in exts:
+                    counts[lang] += 1
+                    break
     if not any(counts.values()):
         return None
     return max(counts, key=counts.get)

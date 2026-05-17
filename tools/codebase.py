@@ -522,12 +522,73 @@ Keep it to 5-8 specific, targeted patterns."""
 
 # ─── Reference Search ──────────────────────────────────────────────────────
 
+def _refs_definition_pass(name: str, root: str, ignore_args: list[str]) -> list[dict]:
+    """Narrow ripgrep for DEFINITION lines only, with NO global cap.
+
+    Observed failure on xarray__xarray-6938: a normal REFS pass with
+    max_results=30 returned 30 usage entries from tests/docs and ZERO
+    definition entries — the actual `def to_index_variable(self):` lines
+    in xarray/core/variable.py were truncated out by the cap. The
+    planner had no signal about WHERE the method is defined.
+
+    This pass runs a precise regex matching common definition syntaxes
+    across languages, with `--max-count` not applied so every definition
+    surfaces regardless of how many usages exist elsewhere. The hit
+    count is small by definition (a symbol usually has 1-5 definition
+    sites), so there's no risk of context explosion.
+    """
+    # Definition patterns per language, all anchored to start-of-line
+    # (with optional indentation). Each pattern uses `\b{name}\b` for
+    # word-boundary safety and ripgrep's `-P` PCRE mode so we can use
+    # `(?:async\s+)?` and `\bNAME\b` together.
+    escaped = re.escape(name)
+    patterns = [
+        # Python: def/async def/class
+        rf"^\s*(?:async\s+)?def\s+{escaped}\b",
+        rf"^\s*class\s+{escaped}\b",
+        # JS/TS: function/const/let/var/class/export
+        rf"^\s*(?:export\s+(?:default\s+)?)?function\s+{escaped}\b",
+        rf"^\s*(?:export\s+)?(?:const|let|var)\s+{escaped}\b",
+        rf"^\s*(?:export\s+)?class\s+{escaped}\b",
+        # Rust: fn/struct/enum/trait
+        rf"^\s*(?:pub\s+)?(?:async\s+)?fn\s+{escaped}\b",
+        rf"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+{escaped}\b",
+        # Go: func / type
+        rf"^\s*func\s+(?:\([^)]+\)\s+)?{escaped}\b",
+        rf"^\s*type\s+{escaped}\b",
+        # C/C++/Java: ret-type Name(  — looser, accept method/function signatures
+        rf"^\s*[A-Za-z_][\w:<>,\s\*&]*\s+{escaped}\s*\(",
+    ]
+    combined = "|".join(f"(?:{p})" for p in patterns)
+    try:
+        cmd = [
+            "rg", "--line-number", "--no-heading", "--color=never",
+            "-P",  # PCRE mode for the alternations
+            *ignore_args,
+            combined, root,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode > 1 or not result.stdout.strip():
+            return []
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    # No cap: parse all hits.
+    return _parse_rg_output(result.stdout, max_results=10_000)
+
+
 def search_refs(name: str, root: str, max_results: int = 30) -> str:
     """
     Find all references to a function/class/variable by name.
     Uses word-boundary matching so searching "render" won't match "prerender".
     Groups results by: definitions, imports, and usages.
     Returns formatted string.
+
+    Two-pass strategy to avoid the xarray-6938 truncation bug:
+      1. Narrow definition-only pass (no cap) — guarantees every `def name`
+         / `class name` / language equivalent appears in the DEFINED bucket.
+      2. Standard usage pass capped at max_results — usages live here.
+    Definitions from pass 1 are merged into the final DEFINED list even if
+    they didn't survive the cap in pass 2.
     """
     root = str(Path(root).resolve())
 
@@ -537,6 +598,9 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
         ignore_args.extend(["--glob", f"!{d}/"])
     for suffix in IGNORE_DIR_SUFFIXES:
         ignore_args.extend(["--glob", f"!*{suffix}/"])
+
+    # PASS 1 — definitions only, uncapped. See helper docstring.
+    definition_hits = _refs_definition_pass(name, root, ignore_args)
 
     # Use ripgrep with word boundary.
     # No --max-filesize: the old 200K cap silently skipped large files like
@@ -581,7 +645,21 @@ def search_refs(name: str, root: str, max_results: int = 30) -> str:
     raw_results = _parse_rg_output(result.stdout, max_results)
 
     if not raw_results:
-        return f"Search for '{name}': no matches found"
+        # Even if pass 2 has nothing, pass 1 may have caught definitions.
+        if not definition_hits:
+            return f"Search for '{name}': no matches found"
+
+    # Merge pass-1 definitions in front so they're never lost to the cap.
+    # Dedupe by (file, line_num).
+    seen_keys: set[tuple[str, int]] = set()
+    merged: list[dict] = []
+    for item in (definition_hits + raw_results):
+        key = (item.get("file", ""), item.get("line_num", 0))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        merged.append(item)
+    raw_results = merged
 
     # Categorize results
     definitions = []
