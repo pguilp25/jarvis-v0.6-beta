@@ -10788,8 +10788,8 @@ def _guess_filename(task: str, content: str) -> str:
     if "public class" in content_start or "public static void main" in content_start:
         return "Main.java"
     if "#include" in content_start:
-        return "main.cpp" if "iostream" or "cstdio" in content_start else "main.c"
-    if "theorem " in content_start or "import Mathlib" in content_start:
+        return "main.cpp" if ("iostream" in content_start or "cstdio" in content_start) else "main.c"
+    if "theorem " in content_start or "import mathlib" in content_start:
         return "proof.lean"
     if content_start.strip().startswith("{"):
         return "data.json"
