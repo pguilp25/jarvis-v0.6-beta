@@ -251,6 +251,11 @@ def _norm_key(tag_type: str, clean_arg: str) -> str:
     s = clean_arg.strip().replace("\\", "/")
     while s.startswith("./"):
         s = s[2:]
+    # Re-strip after `./` removal — the path after the prefix may have
+    # had leading whitespace (e.g. `./ foo.py` from a model that double-
+    # spaced after the dot-slash). Without this, `./ foo.py` keyed
+    # differently from `foo.py`, breaking the equivalence class.
+    s = s.strip()
     # Collapse runs of internal whitespace to a single space so
     # `[KEEP: foo.py  10-20]` and `[KEEP: foo.py 10-20]` key the same.
     s = re.sub(r'\s+', ' ', s)
