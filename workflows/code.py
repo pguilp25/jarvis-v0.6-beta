@@ -1734,78 +1734,31 @@ Walk through the user's experience after ALL steps are implemented:
   If your trace produces the wrong answer, fix the design before writing
   the plan. A wrong design implemented correctly is still wrong.
 
-  CHECK: For FIX tasks — TRACE THE FAILING SCENARIO through the patched
-  code, end-to-end. This is the BUG-FIX analogue of the LOGIC trace above.
-  Most "almost right" fixes patch ONE site of a multi-site bug; this trace
-  is what surfaces the missed sites BEFORE the plan ships.
+  CHECK: For FIX tasks — TRACE THE FAILING SCENARIO. The single
+  highest-leverage check before [PLAN DONE]. Budget: ONE short
+  `[think]` block, not multiple rounds. Five lines suffice:
 
-  Do it concretely, in `[think]`:
+    a) SCENARIO: the EXACT failing input (one sentence — repro snippet,
+       failing test input, or error trace). Concrete, not a category.
+    b) PRINCIPLE: the abstract property the buggy input violates
+       (one sentence — generalizes beyond the example).
+    c) SITES: walk the input through the affected file(s). List every
+       line where the principle could be violated. Don't dismiss any
+       without checking — "probably still works" without verification
+       is the failure mode this check exists to catch.
+    d) COVERAGE: confirm every listed site is addressed by a STEP.
+       If gaps remain, EXTEND the plan now.
+     e) OUTCOME: state in one line what the input produces after all
+       steps land. If you can't, go back to (c).
 
-    Step 1 — NAME THE FAILING SCENARIO in one sentence.
-      Use whatever the user gave you: failing test input, reproducer
-      snippet, error trace, or expected-vs-actual mismatch. Pick a
-      SPECIFIC concrete input, not a category.
-      ✗ "lowercase commands"
-      ✓ "Table.read(io.StringIO('read serr 1 2\\n1 0.5 1 0.5'),
-          format='ascii.qdp') — must produce a Table with one row and
-          'serr' error columns 1 and 2, not raise ValueError."
+  Two distinct failure shapes this catches:
+    • MULTI-SITE bugs (the principle violates at 2-N sites; shipping a
+      one-site fix leaves the rest broken).
+    • WRONG-SITE fixes (the chosen site doesn't actually appear on the
+      input's execution path; the buggy behavior emerges upstream).
 
-    Step 2 — ARTICULATE THE PRINCIPLE the bug violates in one sentence.
-      What ABSTRACT property must hold for the scenario to succeed?
-      The principle is what generalizes; the symptom is what you saw.
-      ✗ "_command_re needs (?i:)"
-      ✓ "every string-recognition step in the QDP parser must accept
-         both cases — regex matching AND value comparisons against
-         literals like 'NO'."
-
-    Step 3 — ENUMERATE SITES where that principle could be violated
-      in the affected file(s). Walk the input through the relevant
-      functions. AT EACH function/branch ask:
-        "After my fix, does THIS line behave correctly for the
-         scenario's input? Or could the bug still emerge here?"
-      List every site that could fail. Don't dismiss any without
-      checking. The phrase "this probably still works" without an
-      explicit trace IS the failure mode you're trying to avoid.
-
-    Step 4 — EVERY UNADDRESSED SITE GETS A STEP (or merges into an
-      existing one). If sites 1 and 2 are covered but site 3 isn't,
-      EXTEND the plan now. Do not signal [PLAN DONE] while a site
-      is unaddressed.
-
-    Step 5 — STATE THE END-TO-END OUTCOME after all your steps land:
-      "After STEPS 1-N, the scenario input X produces Y (the expected
-       behavior)." If you can't honestly write this, the plan misses
-       something — go back to Step 3.
-
-  Observed failure (astropy-14365 case-insensitive QDP):
-    Step 1 (scenario): "Table.read(file with 'read serr 1 2') should
-                        succeed."
-    Step 2 (principle): "QDP parser must accept lowercase commands AND
-                        lowercase 'no' value markers."
-    Step 3 (sites enumerated):
-      - qdp.py:62 _command_re regex (uppercase-only)   ← shipped fix
-      - qdp.py:68 _line_type_re compiles without IGNORECASE
-                  (so _new_re/_data_re only match uppercase "NO")
-      - qdp.py:309 `v == "NO"` value comparison (uppercase-only)
-    Step 4 (gap): the shipped fix only addressed site 1. Sites 2-3 went
-      uncovered → test_roundtrip[True] still failed because lowercase
-      data files have lowercase 'no' markers the parser still rejects.
-
-  Observed failure (astropy-13977 NotImplemented for duck quantities):
-    Step 1 (scenario): "duck_quantity + Quantity → must return
-                        NotImplemented from __array_ufunc__ so duck
-                        gets a chance to handle it."
-    Step 2 (principle): "any leg of __array_ufunc__ that can't handle
-                        a duck-quantity input must fall through to
-                        NotImplemented, not raise."
-    Step 3 (sites): _condition_arg / converter loop / function call /
-                    __out__ post-processing — each is a fall-through
-                    candidate. The shipped plan picked the converter
-                    loop alone; the actual failure was upstream.
-
-  Walking Step 3 catches BOTH "missed second site" and "wrong single
-  site" failures. It is cost-zero (lives in [think]) and decides
-  whether your plan is complete or premature.
+  Do this once; don't loop. Cost: ~30 seconds of [think]. Saves a
+  failed eval cycle.
 
 ## TEST CRITERIA
 Steps a human can run to verify the goal is achieved.
@@ -3274,59 +3227,25 @@ edits, apply them, do the ONE verify read, then [DONE][CONFIRM_DONE].
        belongs at the for's level, not the for-body's level.
    If anything is at the wrong level, fix it before [DONE].
 
-7. SCENARIO TRACE — before [DONE] [CONFIRM_DONE], FIX tasks only
+7. SCENARIO TRACE — FIX tasks only, before [DONE] [CONFIRM_DONE]
    (skip for ADD / REFACTOR / pure new-file work)
-   The byte-difference check catches "I emitted code", the indent
-   check catches "the code is structurally valid". This step catches
-   "the code actually fixes the bug" — the gap between a syntactically
-   correct edit and a behaviorally correct fix.
+   Byte-difference + indent checks catch "code is structurally valid";
+   this catches "code actually fixes the bug". Budget: ONE short
+   [think] block.
 
-   In [think] (cost zero — stripped from artifact), do this:
-
-   a) NAME the failing scenario in ONE concrete sentence — the exact
-      input that misbehaves, taken from the user's repro / failing
-      test / error message. Not a category.
-        ✗ "lowercase commands"
-        ✓ "_line_type('read serr 1 2') must return 'command', not
-           raise ValueError"
-
-   b) WALK the patched code through that input, one decision point
-      at a time. AT EACH branch, line, or comparison ask:
-        "Does this line behave correctly for this input AFTER my
-         edit? Or could the bug still emerge here?"
-      Don't dismiss a line as "fine" without checking — that
-      dismissal IS the failure mode you are trying to avoid.
-
-   c) IF the trace produces the EXPECTED output → [DONE].
-
-   d) IF the trace surfaces a site the edit didn't address:
-      - If the site is in THIS step's scope (same file, same
-        functional area as the plan named) → write the missing
-        edit now. Repeat the trace.
-      - If the site is OUT OF SCOPE for this step (different file,
-        different function, the plan didn't mention it) → DO NOT
-        invent a new step. Surface the gap explicitly in your
-        final [think] ("MISSED SITE: <file>:<func> — bug also
-        manifests at this comparison; out of this step's scope —
-        reviewer should pick up"). Then [DONE] with what you have.
-
-   e) IF the trace can't even complete because you don't understand
-      what input the test feeds → fire `[CODE: <test_file>]` and
-      read the assertion. Don't ship an edit you can't trace.
-
-   Observed failure (astropy-14365): coder fixed `_command_re` regex
-   case-insensitivity. Edit was byte-different, anchor unique, indent
-   correct. But tracing `_line_type('read serr 1 2')` through the
-   patched code would have surfaced that `_new_re`/`_data_re` also
-   match uppercase-only and `v == "NO"` later in `_get_tables_*` is
-   also case-sensitive — `test_roundtrip[True]` failed for those
-   sites. ONE 30-second trace would have caught it.
-
-   Observed failure (astropy-13977): coder wrapped converter loop
-   in try/except → byte-different, valid syntax. But tracing
-   `duck_quantity + Quantity` through `__array_ufunc__` would have
-   shown the converter doesn't TypeError on duck inputs — the
-   issue lives upstream. The fix landed at the wrong site.
+   a) NAME the failing input in ONE concrete sentence (from the
+      user's repro / test / error trace — not a category).
+   b) WALK the patched code mentally through that input. At each
+      decision point ask: "Does this behave correctly NOW? Or could
+      the bug still emerge here?"
+   c) TRACE LANDS RIGHT → [DONE].
+   d) TRACE SURFACES A GAP:
+      - In this step's scope (same file/function the plan named) →
+        write the missing edit, repeat trace.
+      - Out of scope → write "MISSED SITE: file:func — <why>" in
+        your final [think] for the reviewer. Then [DONE].
+   e) Can't complete the trace? Fire [CODE: <test_file>] for the
+      assertion, then trace. Don't ship an untraced edit.
 
 ══════════════════════════════════════════════════════════════════════
 HARD RULES
